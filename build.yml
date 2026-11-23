@@ -1,0 +1,53 @@
+name: Build PSP (EBOOT.PBP + ISO)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ghcr.io/pspdev/pspdev:latest
+
+    steps:
+      - name: Baixar o codigo
+        uses: actions/checkout@v4
+
+      - name: Compilar (PSPSDK)
+        run: |
+          make clean || true
+          make
+          ls -la *.prx EBOOT.PBP PARAM.SFO
+
+      - name: Instalar ferramenta de ISO
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq && apt-get install -y -qq genisoimage
+          elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache cdrkit
+          fi
+
+      - name: Montar ISO para o PPSSPP
+        run: |
+          mkdir -p iso/PSP_GAME/SYSDIR iso/PSP_GAME/USRDIR
+          cp SobrevivendoEmGS.prx iso/PSP_GAME/SYSDIR/EBOOT.BIN
+          cp ICON0.PNG iso/PSP_GAME/ICON0.PNG
+          if ! mksfoex -d MEMSIZE=1 -s CATEGORY=UG -s DISC_ID=SGSB00001 -s DISC_VERSION=1.00 \
+               -s PSP_SYSTEM_VER=5.00 "Sobrevivendo Em GS" iso/PSP_GAME/PARAM.SFO; then
+            cp PARAM.SFO iso/PSP_GAME/PARAM.SFO
+          fi
+          printf 'SGSB00001|0000000000000000|0000|G' > iso/UMD_DATA.BIN
+          if command -v mkisofs >/dev/null 2>&1; then MK=mkisofs; else MK=genisoimage; fi
+          $MK -iso-level 4 -xa -A "PSP GAME" -V "SOBREVIVENDOEMGS" -sysid "PSP GAME" \
+              -volset "" -p "" -publisher "" -o SobrevivendoEmGS.iso iso/
+          ls -la SobrevivendoEmGS.iso
+
+      - name: Publicar arquivos
+        uses: actions/upload-artifact@v4
+        with:
+          name: SobrevivendoEmGS
+          path: |
+            EBOOT.PBP
+            SobrevivendoEmGS.iso
+            SobrevivendoEmGS.prx

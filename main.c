@@ -1,1837 +1,1755 @@
-/*
- * SOBREVIVENDO EM GS - PSP (PSPSDK) - acao e sobrevivencia em mundo aberto 3D
- * Desenvolvido por MECANIC ENGINE GAMER
- *
- * Controles:
- *   Analogico  : andar            L / R : girar camera
- *   X          : interagir (pegar arma, revistar, beber, acampamento, helicoptero)
- *   Quadrado   : atacar (segure para armas automaticas)   Circulo : rolar (esquiva)
- *   Triangulo  : trocar de arma   Esq/Dir : escolher item   Cima : usar item
- *   Start      : menu (salvar/sair)       Select : ajuda
- */
+/*=====================================================================
+  SOBREVIVENDO EM GS  -  Jogo de sobrevivencia zumbi para PSP / PPSSPP
+  ---------------------------------------------------------------------
+  - Camera em primeira pessoa (3D com sceGu), mapa 800x800 m
+  - Mira dinamica por arma, 3 armas, recarga, medkit
+  - Carros com as texturas do arquivo carros.png (cars_data.h)
+  - Sobreviventes para recrutar (seguem e atiram nos zumbis)
+  - Loja no menu (armas, itens e carros) com dinheiro e save
+  - Camada de rede preparada para multiplayer (pacotes + loopback)
+
+  Controles (no jogo):
+    Analogico ........ andar / (no carro: acelerar e esterçar)
+    D-Pad ............ olhar (esq/dir = girar, cima/baixo = inclinar)
+    R ................ atirar        L ........ mirar (zoom)
+    Quadrado ......... recarregar    (no carro: freio de mao)
+    Circulo .......... trocar arma   X ........ correr
+    Triangulo ........ interagir (recrutar / entrar / sair do carro)
+    Select ........... usar kit medico        Start .... pausa
+=====================================================================*/
 #include <pspkernel.h>
-#include <pspdebug.h>
 #include <pspdisplay.h>
+#include <pspdebug.h>
 #include <pspctrl.h>
-#include <pspiofilemgr.h>
-#include <pspaudio.h>
 #include <pspgu.h>
 #include <pspgum.h>
-#include <math.h>
-#include <string.h>
+#include <psputils.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <math.h>
+#include "cars_data.h"
 
 PSP_MODULE_INFO("SobrevivendoEmGS", 0, 1, 0);
-PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
+PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
 
-#define BUF_W   512
-#define SCR_W   480
-#define SCR_H   272
-#define FRAME   0x88000
-#define PI_F    3.14159265f
-#define WORLD   95.0f
+/*------------------------------ constantes --------------------------*/
+#define SCR_W 480
+#define SCR_H 272
+#define BUF_W 512
+#define FRAME_SIZE (BUF_W * SCR_H * 4)
+#define PI 3.14159265f
 
-typedef struct { float nx, ny, nz, x, y, z; } Vtx;
-#define VTX_TYPE (GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
+#define WORLD_HALF 400.0f
+#define MAX_ZOMBIES 40
+#define MAX_CARS 40
+#define MAX_SURV 16
+#define MAX_BLD 440
+#define MAX_TREES 700
+#define MAX_CAMPS 16
+#define MAX_FOLLOW 5
 
-static unsigned int __attribute__((aligned(16))) list[262144];
-static Vtx __attribute__((aligned(16))) cube[36];
-#define GTILE 12.0f
-#define GN    16
-static Vtx __attribute__((aligned(16))) groundA[GN * GN / 2 * 6];
-static Vtx __attribute__((aligned(16))) groundB[GN * GN / 2 * 6];
+#define RGB(r, g, b) (0xFF000000u | ((unsigned)(b) << 16) | ((unsigned)(g) << 8) | (unsigned)(r))
+#define RGBA(r, g, b, a) (((unsigned)(a) << 24) | ((unsigned)(b) << 16) | ((unsigned)(g) << 8) | (unsigned)(r))
 
-/* ---------- callbacks de saida ---------- */
-static volatile int running = 1;
-static int exit_cb(int a, int b, void *c) { running = 0; return 0; }
-static int cb_thread(SceSize args, void *argp) {
-    int id = sceKernelCreateCallback("exit", exit_cb, NULL);
-    sceKernelRegisterExitCallback(id);
+#define FOG_COL RGB(96, 102, 112)
+
+static unsigned int __attribute__((aligned(16))) dlist[524288];
+static int draw_off = 0;
+
+/*------------------------------ utilidades --------------------------*/
+static unsigned int rng_state = 12345u;
+static unsigned int rnd_u(void) { rng_state = rng_state * 1664525u + 1013904223u; return rng_state; }
+static float frand(void) { return (float)(rnd_u() >> 8) / 16777216.0f; }
+static float frange(float a, float b) { return a + (b - a) * frand(); }
+static float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
+static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+static float dist2(float ax, float az, float bx, float bz) { float dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; }
+
+static unsigned int shade(unsigned int c, float k)
+{
+    int r = (int)((c & 255) * k), g = (int)(((c >> 8) & 255) * k), b = (int)(((c >> 16) & 255) * k);
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return (c & 0xFF000000u) | ((unsigned)b << 16) | ((unsigned)g << 8) | (unsigned)r;
+}
+
+/*------------------------------ callbacks ---------------------------*/
+static int exit_callback(int a1, int a2, void *arg) { (void)a1; (void)a2; (void)arg; sceKernelExitGame(); return 0; }
+static int callback_thread(SceSize args, void *argp)
+{
+    int cbid = sceKernelCreateCallback("Exit Callback", exit_callback, NULL);
+    (void)args; (void)argp;
+    sceKernelRegisterExitCallback(cbid);
     sceKernelSleepThreadCB();
     return 0;
 }
-static void setup_callbacks(void) {
-    int t = sceKernelCreateThread("cb", cb_thread, 0x11, 0xFA0, 0, NULL);
-    if (t >= 0) sceKernelStartThread(t, 0, NULL);
+static void setup_callbacks(void)
+{
+    int thid = sceKernelCreateThread("update_thread", callback_thread, 0x11, 0xFA0, 0, 0);
+    if (thid >= 0) sceKernelStartThread(thid, 0, 0);
 }
 
-/* ---------- cubo unitario (base em y=0, centrado em x/z) ---------- */
-static void build_cube(void) {
-    static const float F[6][9] = {
-        { 1, 0, 0,   0, 1, 0,   0, 0, 1},   /* +X */
-        {-1, 0, 0,   0, 0, 1,   0, 1, 0},   /* -X */
-        { 0, 1, 0,   0, 0, 1,   1, 0, 0},   /* +Y */
-        { 0,-1, 0,   1, 0, 0,   0, 0, 1},   /* -Y */
-        { 0, 0, 1,   1, 0, 0,   0, 1, 0},   /* +Z */
-        { 0, 0,-1,   0, 1, 0,   1, 0, 0}    /* -Z */
-    };
-    static const int S[6][2] = {{-1,-1},{1,-1},{1,1},{-1,-1},{1,1},{-1,1}};
-    int i = 0;
-    for (int f = 0; f < 6; f++) {
-        const float *d = F[f];
-        for (int k = 0; k < 6; k++) {
-            float su = S[k][0] * 0.5f, sv = S[k][1] * 0.5f;
-            cube[i].nx = d[0]; cube[i].ny = d[1]; cube[i].nz = d[2];
-            cube[i].x = d[0]*0.5f + d[3]*su + d[6]*sv;
-            cube[i].y = 0.5f + d[1]*0.5f + d[4]*su + d[7]*sv;
-            cube[i].z = d[2]*0.5f + d[5]*su + d[8]*sv;
-            i++;
+/*------------------------------ dados dos carros --------------------*/
+typedef struct { const char *name; float vmax; float acc; int hp; int price; } CarDef;
+static const CarDef CARS[CAR_COUNT] = {
+    {"Uno",                 28, 13, 100,     0},
+    {"Gol GTS",             32, 14, 100,  1800},
+    {"Opala",               34, 13, 120,  2500},
+    {"Maverick",            38, 16, 120,  4000},
+    {"Chevrolet D20",       29, 11, 170,  3000},
+    {"Hilux",               33, 13, 180,  4500},
+    {"F-1000",              28, 11, 180,  3200},
+    {"Fusca",               24,  9,  90,   900},
+    {"Kombi",               23,  9, 140,  1500},
+    {"Sprinter",            27, 10, 160,  2800},
+    {"Pickup Blindada",     31, 12, 320,  9000},
+    {"Buggy",               36, 17,  80,  5000},
+    {"Jeep",                31, 14, 150,  4000},
+    {"Trator",              15,  7, 220,  2000},
+    {"Monster Truck",       29, 12, 350, 12000},
+    {"Viatura Policial",    38, 16, 160,  7000},
+    {"Ambulancia",          31, 12, 150,  6000},
+    {"Guincho",             24, 10, 200,  3500},
+    {"Caminhao Militar",    26, 10, 280,  8000},
+    {"Caminhao Combustivel",22,  9, 180,  5500},
+};
+
+/*------------------------------ armas -------------------------------*/
+typedef struct { const char *name; float dmg; int pellets; float spread; float rate; int mag; float range; int automatic; float recoil; } WeaponDef;
+static const WeaponDef WEAP[3] = {
+    {"PISTOLA",    34, 1, 0.010f, 0.28f, 12,  90, 0, 0.035f},
+    {"ESPINGARDA", 16, 9, 0.060f, 0.85f,  6,  40, 0, 0.120f},
+    {"RIFLE",      26, 1, 0.018f, 0.11f, 30, 130, 1, 0.018f},
+};
+static const int CROSS_GAP[3] = {5, 15, 7};
+
+/*------------------------------ texturas ----------------------------*/
+static unsigned int __attribute__((aligned(16))) tex_white[8 * 8];
+static unsigned int __attribute__((aligned(16))) tex_ground[64 * 64];
+static unsigned int __attribute__((aligned(16))) tex_road[64 * 64];
+static unsigned int __attribute__((aligned(16))) tex_wall[64 * 64];
+enum { T_WHITE = 0, T_GROUND, T_ROAD, T_WALL, T_CAR };
+
+static int hash2(int x, int y)
+{
+    unsigned int h = (unsigned)x * 374761393u + (unsigned)y * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return (int)((h ^ (h >> 16)) & 255u);
+}
+
+static void gen_textures(void)
+{
+    int x, y;
+    for (x = 0; x < 64; x++) tex_white[x] = 0xFFFFFFFFu;
+    for (y = 0; y < 64; y++)
+        for (x = 0; x < 64; x++) {
+            int n = hash2(x, y) - 128;
+            int g = hash2(x / 3, y / 3) - 128;
+            /* chao: terra/grama suja */
+            int r = 78 + n / 10 + g / 8, gg = 84 + n / 9 + g / 8, b = 56 + n / 12;
+            tex_ground[y * 64 + x] = RGB(clampf(r, 0, 255), clampf(gg, 0, 255), clampf(b, 0, 255));
+            /* asfalto com faixas */
+            int a = 58 + n / 14;
+            unsigned int col = RGB(a, a, a + 4);
+            if (x == 3 || x == 60) col = RGB(190, 190, 185);
+            if ((x == 31 || x == 32) && (y % 32) < 16) col = RGB(205, 170, 40);
+            tex_road[y * 64 + x] = col;
+            /* parede com tijolos e janelas */
+            int row = y / 8, off = (row & 1) * 8;
+            int base = 185 + n / 12;
+            unsigned int w = RGB(base, base - 6, base - 16);
+            if ((y % 8) == 0 || ((x + off) % 16) == 0) w = RGB(140, 132, 120);
+            if (((x >= 8 && x < 24) || (x >= 40 && x < 56)) && ((y >= 10 && y < 26) || (y >= 38 && y < 54))) {
+                int lit = hash2(x / 16, y / 28) < 40;
+                w = lit ? RGB(210, 190, 110) : RGB(38 + n / 20, 48 + n / 20, 60 + n / 20);
+                if (x % 16 == 8 || y % 28 == 10) w = RGB(90, 86, 80);
+            }
+            tex_wall[y * 64 + x] = w;
         }
-    }
     sceKernelDcacheWritebackAll();
 }
 
-/* chao: ladrilhos pequenos (pecas gigantes bugam no PSP) */
-static void build_ground(void) {
-    int na = 0, nb = 0;
-    for (int i = 0; i < GN; i++) {
-        for (int j = 0; j < GN; j++) {
-            float x0 = -96.0f + i * GTILE, z0 = -96.0f + j * GTILE;
-            float x1 = x0 + GTILE, z1 = z0 + GTILE;
-            float xs[6] = { x0, x1, x1, x0, x1, x0 };
-            float zs[6] = { z0, z0, z1, z0, z1, z1 };
-            Vtx *v = ((i + j) & 1) ? &groundB[nb] : &groundA[na];
-            for (int k = 0; k < 6; k++) {
-                v[k].nx = 0; v[k].ny = 1; v[k].nz = 0;
-                v[k].x = xs[k]; v[k].y = 0; v[k].z = zs[k];
-            }
-            if ((i + j) & 1) nb += 6; else na += 6;
-        }
+static void tex_bind(int id, int repeat, int linear)
+{
+    const void *p;
+    int w = 64, h = 64, fmt = GU_PSM_8888;
+    switch (id) {
+    case T_WHITE: p = tex_white; w = 8; h = 8; break;
+    case T_GROUND: p = tex_ground; break;
+    case T_ROAD: p = tex_road; break;
+    case T_WALL: p = tex_wall; break;
+    default: p = cars_data[id - T_CAR]; w = CAR_TEX_W; h = CAR_TEX_H; fmt = GU_PSM_5551; break;
     }
-    sceKernelDcacheWritebackAll();
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(fmt, 0, 0, 0);
+    sceGuTexImage(0, w, h, w, p);
+    sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
+    sceGuTexFilter(linear ? GU_LINEAR : GU_NEAREST, linear ? GU_LINEAR : GU_NEAREST);
+    sceGuTexWrap(repeat ? GU_REPEAT : GU_CLAMP, repeat ? GU_REPEAT : GU_CLAMP);
 }
 
-static unsigned int groundC1 = 0xff3c9a3c, groundC2 = 0xff328a34;
+/*------------------------------ vertices / camera -------------------*/
+typedef struct { float u, v; unsigned int c; float x, y, z; } Vtx;
+#define VT3D (GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
+#define VT2D (GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D)
 
-static void draw_ground(void) {
-    sceGumMatrixMode(GU_MODEL);
-    sceGumLoadIdentity();
-    sceGumUpdateMatrix();
-    sceGuColor(groundC1);
-    sceGumDrawArray(GU_TRIANGLES, VTX_TYPE, GN * GN / 2 * 6, 0, groundA);
-    sceGuColor(groundC2);
-    sceGumDrawArray(GU_TRIANGLES, VTX_TYPE, GN * GN / 2 * 6, 0, groundB);
+static float cam_x, cam_y, cam_z, cam_cs = 1, cam_sn = 0, cam_cp = 1, cam_sp = 0;
+static int g_cs = 0; /* 1 = vertices ja estao em espaco de camera (view model) */
+
+static void cam_set(float x, float y, float z, float yaw, float pitch)
+{
+    cam_x = x; cam_y = y; cam_z = z;
+    cam_cs = cosf(yaw); cam_sn = sinf(yaw);
+    cam_cp = cosf(pitch); cam_sp = sinf(pitch);
 }
 
-/* desenha caixa: posicao (base), escala, rotacao Y, cor ABGR */
-static void box(float x, float y, float z, float sx, float sy, float sz,
-                float ry, unsigned int color) {
-    ScePspFVector3 p = {x, y, z}, s = {sx, sy, sz};
-    sceGumMatrixMode(GU_MODEL);
-    sceGumLoadIdentity();
-    sceGumTranslate(&p);
-    sceGumRotateY(ry);
-    sceGumScale(&s);
-    sceGumUpdateMatrix();
-    sceGuColor(color);
-    sceGumDrawArray(GU_TRIANGLES, VTX_TYPE, 36, 0, cube);
+/* convencao: frente = (-sin(yaw), -cos(yaw)), direita = (cos(yaw), -sin(yaw)) */
+static void setv(Vtx *v, float wx, float wy, float wz, float u, float t, unsigned int c)
+{
+    float dx, dy, dz, fh;
+    v->u = u; v->v = t; v->c = c;
+    if (g_cs) { v->x = wx; v->y = wy; v->z = wz; return; }
+    dx = wx - cam_x; dy = wy - cam_y; dz = wz - cam_z;
+    fh = -dx * cam_sn - dz * cam_cs;
+    v->x = dx * cam_cs - dz * cam_sn;
+    v->y = dy * cam_cp - fh * cam_sp;
+    v->z = -(fh * cam_cp + dy * cam_sp);
 }
 
-
-/* ---------- audio (musica + efeitos) ---------- */
-static volatile int musicOn = 1;
-static volatile int sfxQ = 0;
-static volatile int songId = 0;   /* 0 menu, 1 dia, 2 noite, 3 combate, 4 final */
-
-static const unsigned char MEL0[][2] = {
-    {69,2},{72,2}, {76,2},{72,2}, {65,2},{69,2}, {72,2},{69,2},
-    {67,2},{71,2}, {74,2},{71,2}, {64,2},{68,2}, {69,4}
-};
-static const unsigned char MEL1[][2] = {
-    {69,1},{76,1},{72,1},{76,1}, {65,1},{72,1},{69,1},{72,1},
-    {67,1},{74,1},{71,1},{74,1}, {64,1},{71,1},{68,1},{71,1},
-    {69,1},{76,1},{72,1},{76,1}, {65,1},{72,1},{69,1},{72,1},
-    {67,1},{71,1},{74,1},{71,1}, {69,4}
-};
-static const unsigned char MEL2[][2] = {
-    {57,4},{60,4},{53,4},{55,4},{57,4},{64,4},{56,4},{57,4}
-};
-static const unsigned char MEL3[][2] = {
-    {69,1},{69,1},{72,1},{69,1}, {70,1},{70,1},{74,1},{70,1},
-    {69,1},{69,1},{72,1},{76,1}, {75,1},{72,1},{70,1},{69,1},
-    {69,1},{69,1},{72,1},{69,1}, {70,1},{70,1},{74,1},{70,1},
-    {76,1},{75,1},{74,1},{72,1}, {69,4}
-};
-static const unsigned char MEL4[][2] = {
-    {72,1},{76,1},{79,1},{76,1}, {71,1},{74,1},{79,1},{74,1},
-    {69,1},{72,1},{76,1},{72,1}, {69,1},{72,1},{77,1},{72,1},
-    {72,1},{76,1},{79,1},{84,1}, {83,1},{79,1},{74,1},{79,1},
-    {77,1},{76,1},{74,1},{71,1}, {72,4}
-};
-static const unsigned char BASS_[5][8] = {
-    { 45, 45, 41, 41, 43, 43, 40, 45 },
-    { 45, 41, 43, 40, 45, 41, 43, 45 },
-    { 45, 48, 41, 43, 45, 40, 44, 45 },
-    { 45, 46, 45, 43, 45, 46, 40, 45 },
-    { 48, 43, 45, 41, 48, 43, 43, 48 }
-};
-typedef struct { const unsigned char (*mel)[2]; int n; int step; int bassMode; float vol; } Song;
-#define NM(a) ((int)(sizeof(a) / sizeof((a)[0])))
-static const Song SONGS[5] = {
-    { MEL0, NM(MEL0), 18000, 0, 0.20f },
-    { MEL1, NM(MEL1), 12500, 0, 0.21f },
-    { MEL2, NM(MEL2), 22000, 0, 0.18f },
-    { MEL3, NM(MEL3),  7500, 1, 0.24f },
-    { MEL4, NM(MEL4), 14000, 0, 0.22f }
-};
-/* frequencia negativa = ruido */
-static const float SFXF[13][3]  = { {0,0,0}, {-1,150,0}, {400,250,0}, {-1,0,0}, {880,1175,0}, {440,0,0}, {120,90,0},
-                                    {80,70,0}, {300,450,0}, {523,659,784}, {160,0,0}, {1000,800,1000}, {-1,0,0} };
-static const int   SFXMS[13][3] = { {0,0,0}, {60,50,0}, {30,45,0}, {55,0,0}, {60,100,0}, {40,0,0}, {90,90,0},
-                                    {200,200,0}, {80,80,0}, {60,60,90}, {180,0,0}, {90,90,90}, {300,0,0} };
-
-/* 1 tiro 2 golpe 3 acerto 4 coleta 5 clique 6 dano 7 gemido 8 rolar 9 abrir 10 erro 11 radio 12 helice */
-static void play_sfx(int t) { sfxQ = t; }
-
-static float midi_freq(int m) { return 440.0f * powf(2.0f, (m - 69) / 12.0f); }
-
-static int audio_thread(SceSize args, void *argp) {
-    static short buf[1024 * 2] __attribute__((aligned(64)));
-    static float mfreq[5][40], bfreq[5][8];
-    int ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, 1024, PSP_AUDIO_FORMAT_STEREO);
-    if (ch < 0) return 0;
-    for (int sg = 0; sg < 5; sg++) {
-        for (int i = 0; i < SONGS[sg].n && i < 40; i++) mfreq[sg][i] = midi_freq(SONGS[sg].mel[i][0]);
-        for (int i = 0; i < 8; i++) bfreq[sg][i] = midi_freq(BASS_[sg][i]);
-    }
-    int cs = 0, mi = 0, mpos = 0, songStep = 0, sType = 0, sPos = 0;
-    float mph = 0, bph = 0, sph = 0;
-    unsigned int rng = 12345u;
-    while (running) {
-        int sid = songId;
-        if (sid < 0 || sid > 4) sid = 0;
-        if (sid != cs) { cs = sid; mi = 0; mpos = 0; songStep = 0; }
-        const Song *sg = &SONGS[cs];
-        for (int i = 0; i < 1024; i++) {
-            float out = 0;
-            if (musicOn) {
-                int nlen = sg->mel[mi][1] * sg->step;
-                float env = 1.0f - 0.6f * ((float)mpos / (float)nlen);
-                float att = (mpos < 400) ? (mpos / 400.0f) : 1.0f;
-                float bf = bfreq[cs][(songStep / 4) % 8];
-                if (sg->bassMode && (songStep & 1)) bf *= 1.5f;
-                mph += mfreq[cs][mi] / 44100.0f; if (mph >= 1.0f) mph -= 1.0f;
-                bph += bf / 44100.0f; if (bph >= 1.0f) bph -= 1.0f;
-                out += (4.0f * fabsf(mph - 0.5f) - 1.0f) * env * att * sg->vol;
-                out += (4.0f * fabsf(bph - 0.5f) - 1.0f) * 0.14f;
-                if (++mpos >= nlen) {
-                    mpos = 0; songStep += sg->mel[mi][1];
-                    if (++mi >= sg->n) { mi = 0; songStep = 0; }
-                }
-            }
-            if (sfxQ) { sType = sfxQ; sfxQ = 0; sPos = 0; }
-            if (sType) {
-                int ms = sPos * 1000 / 44100, acc = 0, seg = -1;
-                for (int k = 0; k < 3; k++) {
-                    int d = SFXMS[sType][k];
-                    if (d == 0) break;
-                    if (ms < acc + d) { seg = k; break; }
-                    acc += d;
-                }
-                if (seg < 0) sType = 0;
-                else {
-                    float f = SFXF[sType][seg];
-                    float dec = 1.0f - 0.5f * (float)(ms - acc) / (float)SFXMS[sType][seg];
-                    float v;
-                    if (f < 0) { rng = rng * 1664525u + 1013904223u; v = ((rng >> 16) & 1) ? 1.0f : -1.0f; }
-                    else { sph += f / 44100.0f; if (sph >= 1.0f) sph -= 1.0f; v = (sph < 0.5f) ? 1.0f : -1.0f; }
-                    out += v * 0.15f * dec;
-                    sPos++;
-                }
-            }
-            float o = out * 30000.0f;
-            if (o > 32000.0f) o = 32000.0f;
-            if (o < -32000.0f) o = -32000.0f;
-            buf[i * 2] = buf[i * 2 + 1] = (short)o;
-        }
-        sceAudioOutputBlocking(ch, 0x5000, buf);
-    }
-    sceAudioChRelease(ch);
-    return 0;
-}
-
-/* ---------- dados do mundo ---------- */
-#define NITEMS  10
-#define NITEMS_OLD 8
-#define NW      8
-#define NWP     10
-#define NLOOT   64
-#define NTREES  220
-#define NZ      40
-#define NZREG   32
-#define NB      13
-#define NROADS  8
-#define NCARS   10
-#define DAY_LEN 360.0f
-#define SAFE_R  13.0f
-#define BASE_X  0.0f
-#define BASE_Z  0.0f
-#define HELI_X  11.0f
-#define HELI_Z  7.0f
-#define LAKE_X  (-48.0f)
-#define LAKE_Z  32.0f
-#define LAKE_HX 14.0f
-#define LAKE_HZ 10.0f
-
-enum { I_MAD, I_SUC, I_PANO, I_COM, I_AGUA, I_BAND, I_MUN, I_PECA, I_CART, I_RIFLE };
-static const char *itemName[NITEMS] = { "Madeira", "Sucata", "Pano", "Comida", "Agua", "Bandagem", "Municao", "Peca radio", "Cartuchos", "Balas rifle" };
-static const char *wName[NW] = { "Punhos", "Bastao", "Machado", "Facao", "Pistola", "SMG", "Escopeta", "Rifle" };
-static const float wDmg[NW]   = { 8.0f, 20.0f, 38.0f, 28.0f, 28.0f, 16.0f, 14.0f, 70.0f };
-static const float wRange[NW] = { 2.0f, 2.7f, 2.9f, 2.8f, 26.0f, 24.0f, 12.0f, 40.0f };
-static const float wCD[NW]    = { 0.35f, 0.45f, 0.70f, 0.38f, 0.40f, 0.13f, 0.85f, 1.00f };
-static const int   wAmmo[NW]  = { -1, -1, -1, -1, I_MUN, I_MUN, I_CART, I_RIFLE };
-static const int   wAuto[NW]  = { 0, 0, 0, 0, 0, 1, 0, 0 };
-static const int   wGive[NW]  = { 0, 0, 0, 0, 12, 30, 8, 6 };
-static const char *survNames[8] = { "Rafa", "Bia", "Leo", "Ana", "Dudu", "Nina", "Caio", "Lia" };
-static const char *diffNames[3] = { "Facil", "Normal", "Dificil" };
-static const float diffDmg[3]   = { 0.6f, 1.0f, 1.5f };
-static const float diffSpd[3]   = { 0.9f, 1.0f, 1.1f };
-
-typedef struct { float x, z, hw, hd, h; unsigned int wall, roof; int door; } Bld;
-static const Bld BLD[NB] = {
-    { 22, -30, 4.0f, 3.0f, 4.0f, 0xff8a9aa8, 0xff303050, -1 },
-    { 34, -30, 3.5f, 3.5f, 5.0f, 0xff7080a0, 0xff202830, -1 },
-    { 46, -30, 4.0f, 3.0f, 4.0f, 0xff909098, 0xff303050, -1 },
-    { 58, -30, 3.5f, 3.0f, 4.5f, 0xff8a9aa8, 0xff202830, -1 },
-    { 22, -44, 3.5f, 3.5f, 5.0f, 0xff5a6a88, 0xff202830, 1 },
-    { 34, -44, 4.5f, 3.0f, 4.0f, 0xff8090a0, 0xff303050, 1 },
-    { 46, -44, 3.5f, 3.5f, 6.0f, 0xff707080, 0xff202830, 1 },
-    { 58, -44, 4.0f, 3.0f, 4.0f, 0xff7080a0, 0xff303050, 1 },
-    { -29, -55, 3.0f, 2.5f, 3.5f, 0xffc0c8d0, 0xff2020b0, 1 },
-    { 60, 20, 4.5f, 3.5f, 5.5f, 0xff2828b0, 0xff303030, 1 },
-    { -65, -15, 1.6f, 1.6f, 16.0f, 0xff707070, 0xff2020d0, 1 },
-    { 62, 50, 4.0f, 3.0f, 4.0f, 0xff506040, 0xff304028, 1 },
-    { 74, 56, 3.0f, 3.0f, 4.0f, 0xff506040, 0xff304028, 1 }
-};
-static const float ROADS[NROADS][4] = {
-    { 0, 0, 0, -37 }, { 0, -37, 70, -37 }, { 0, 0, 0, 70 }, { -70, 0, 0, 0 },
-    { 0, 0, 50, 0 }, { 50, 0, 50, 50 }, { 50, 50, 70, 50 }, { -35, 0, -35, -55 }
-};
-static const float CARS[NCARS][3] = {
-    { 26, -37, 1.57f }, { 42, -36.5f, 1.4f }, { 58, -37.5f, 1.7f }, { 0, -22, 0.1f }, { 1, 35, 0 },
-    { -1, 55, 0.2f }, { -25, 0.5f, 1.57f }, { -52, -0.5f, 1.5f }, { 22, 0, 1.57f }, { 50, 28, 0.1f }
-};
-
-typedef struct { float x, z; int kind, looted; float t; } Loot;
-typedef struct { float x, z, hx, hz, hr, tx, tz, hp, ang, t, atk, hurt, dead, corpse; int type, state, active, horde; } Zomb;
-typedef struct { float x, z; int w, taken; } WPick;
-typedef struct { float x, z, r; int n, brutes; } Zone;
-static const Zone ZONES[5] = {
-    { 40, -37, 22, 10, 1 }, { 68, 53, 12, 5, 3 }, { -29, -55, 10, 3, 0 }, { 60, 20, 10, 3, 0 }, { -65, -15, 10, 3, 0 }
-};
-static const float zHP[3]    = { 60.0f, 40.0f, 170.0f };
-static const float zSpeed[3] = { 3.0f, 6.0f, 2.3f };
-static const float zDmg[3]   = { 9.0f, 7.0f, 22.0f };
-
-static Loot loot[NLOOT]; static int nloot = 0;
-static Zomb zomb[NZ];
-static float treeX[NTREES], treeZ[NTREES], treeH[NTREES];
-static int inv[NITEMS];
-static int hasW[NW] = { 1, 0, 0, 0, 0, 0, 0, 0 };
-static WPick wpick[NWP];
-static int curW = 0, selUse = 0, kills = 0, parts = 0, rescue = 0, deaths = 0, chasers = 0;
-static int mode = 0, menuSel = 0, showHelp = 1, endingSeen = 0;
-static float px = 3.0f, pz = 5.0f, cam = 0, pang = 0;
-static float hp = 100, hunger = 100, thirst = 100, stam = 100;
-static float gameTime = 0, rescueT = 0, hordeT = 0, attackCD = 0, swingT = 0, rollT = 0, rollX = 0, rollZ = 1;
-static float hurtT = 0, shotT = 0, shotX1 = 0, shotZ1 = 0, shotX2 = 0, shotZ2 = 0, moanCD = 0, drinkCD = 0;
-static float msgTimer = 0, deathT = 0;
-static int facingRight = 1, moving = 0;
-static float walkPhase = 0;
-static char msg[64] = "", menuMsg[48] = "";
-static unsigned int seed_rng = 12345;
-static int worldSeed = 0, difficulty = 1, nameIdx = 0, curSlot = 0;
-
-#define APP_SPLASH  0
-#define APP_TITLE   1
-#define APP_NEW     2
-#define APP_LOAD    3
-#define APP_CREDITS 4
-#define APP_POST    5
-#define APP_PLAY    6
-static int appState = APP_SPLASH;
-static float appT = 0, creditsY = 272.0f;
-static int titleSel = 0, nwSel = 0, nwSlot = 0, nwName = 0, nwSeed = 0, nwDiff = 1;
-static int slotSel = 0, delConfirm = -1, creditsFromGame = 0;
-typedef struct { int used, nameIdx, day, parts, kills; } SlotInfo;
-static SlotInfo slotInfos[3];
-
-static float frand(void) {
-    seed_rng = seed_rng * 1664525u + 1013904223u;
-    return (float)((seed_rng >> 8) & 0xFFFF) / 65535.0f;
-}
-static float dist2d(float ax, float az, float bx, float bz) { float dx = ax - bx, dz = az - bz; return sqrtf(dx * dx + dz * dz); }
-#define NEAR(x, z, r) (dist2d(px, pz, (x), (z)) < (r))
-static unsigned int seed_for(int ws) { return ws <= 0 ? 12345u : (unsigned int)ws * 2654435761u + 12345u; }
-
-static void say(const char *s) { strncpy(msg, s, sizeof(msg) - 1); msg[sizeof(msg) - 1] = 0; msgTimer = 3.0f; }
-
-/* ---------- tempo ---------- */
-static float hour_now(void) { return fmodf(gameTime / DAY_LEN * 24.0f + 8.0f, 24.0f); }
-static float daylight(void) { return 0.5f + 0.5f * cosf((hour_now() - 13.0f) * (2.0f * PI_F / 24.0f)); }
-static float nightness(void) { float n = (0.45f - daylight()) / 0.3f; return n < 0 ? 0 : (n > 1 ? 1 : n); }
-static int day_number(void) { return (int)((gameTime / DAY_LEN * 24.0f + 8.0f) / 24.0f) + 1; }
-
-/* ---------- geometria ---------- */
-static int near_road(float x, float z, float m) {
-    for (int i = 0; i < NROADS; i++) {
-        float x1 = ROADS[i][0], z1 = ROADS[i][1], x2 = ROADS[i][2], z2 = ROADS[i][3];
-        float minx = (x1 < x2 ? x1 : x2) - m - 2.5f, maxx = (x1 > x2 ? x1 : x2) + m + 2.5f;
-        float minz = (z1 < z2 ? z1 : z2) - m - 2.5f, maxz = (z1 > z2 ? z1 : z2) + m + 2.5f;
-        if (x >= minx && x <= maxx && z >= minz && z <= maxz) return 1;
-    }
-    return 0;
-}
-
-static void push_out_rect(float *x, float *z, float r, float cx, float cz, float hw, float hd) {
-    float dx = *x - cx, dz = *z - cz;
-    float ox = hw + r - fabsf(dx), oz = hd + r - fabsf(dz);
-    if (ox > 0 && oz > 0) {
-        if (ox < oz) *x += (dx < 0 ? -ox : ox); else *z += (dz < 0 ? -oz : oz);
-    }
-}
-static void collide(float *x, float *z, float r) {
-    for (int i = 0; i < NB; i++) push_out_rect(x, z, r, BLD[i].x, BLD[i].z, BLD[i].hw, BLD[i].hd);
-    push_out_rect(x, z, r, LAKE_X, LAKE_Z, LAKE_HX, LAKE_HZ);
-}
-static void collide_trees(float *x, float *z) {
-    for (int i = 0; i < NTREES; i++) {
-        float dx = *x - treeX[i], dz = *z - treeZ[i];
-        if (dx > 1.5f || dx < -1.5f || dz > 1.5f || dz < -1.5f) continue;
-        float d = sqrtf(dx * dx + dz * dz);
-        if (d < 0.9f && d > 0.001f) { *x = treeX[i] + dx / d * 0.9f; *z = treeZ[i] + dz / d * 0.9f; }
-    }
-}
-static float lake_dist(float x, float z) {
-    float dx = fabsf(x - LAKE_X) - LAKE_HX, dz = fabsf(z - LAKE_Z) - LAKE_HZ;
-    if (dx < 0) dx = 0;
-    if (dz < 0) dz = 0;
-    return sqrtf(dx * dx + dz * dz);
-}
-static int blocked(float x, float z, float margin) {
-    for (int i = 0; i < NB; i++)
-        if (fabsf(x - BLD[i].x) < BLD[i].hw + margin && fabsf(z - BLD[i].z) < BLD[i].hd + margin) return 1;
-    if (lake_dist(x, z) < margin + 1.0f) return 1;
-    if (near_road(x, z, margin - 2.0f)) return 1;
-    if (dist2d(x, z, BASE_X, BASE_Z) < SAFE_R + 4.0f) return 1;
-    if (dist2d(x, z, 68, 53) < 19.0f) return 1;
-    return 0;
-}
-
-/* ---------- mundo ---------- */
-static void add_loot(float x, float z, int kind) {
-    if (nloot >= NLOOT) return;
-    loot[nloot].x = x; loot[nloot].z = z; loot[nloot].kind = kind; loot[nloot].looted = 0; loot[nloot].t = 0;
-    nloot++;
-}
-
-static void respawn_zombie(Zomb *z) {
-    float x, z2; int tries = 0;
-    do {
-        x = z->hx + (frand() * 2 - 1) * z->hr;
-        z2 = z->hz + (frand() * 2 - 1) * z->hr;
-    } while (++tries < 20 && (dist2d(x, z2, BASE_X, BASE_Z) < SAFE_R + 3.0f || lake_dist(x, z2) < 1.5f));
-    z->x = x; z->z = z2; z->tx = x; z->tz = z2;
-    z->hp = zHP[z->type]; z->state = 0; z->dead = 0; z->hurt = 0; z->atk = 0; z->t = frand() * 3.0f;
-}
-
-static void init_world(void) {
-    nloot = 0;
-    for (int i = 0; i < 8; i++) add_loot(BLD[i].x, BLD[i].z + BLD[i].door * (BLD[i].hd + 1.3f), 0);
-    add_loot(-29, -51.2f, 0);                       /* posto */
-    add_loot(60, 24.8f, 0);                         /* fazenda */
-    add_loot(62, 53.5f, 2); add_loot(74, 59.5f, 2); add_loot(66, 60, 2);   /* militar */
-    for (int i = 0; i < NCARS; i++) add_loot(CARS[i][0] + 2.2f, CARS[i][1] + 1.0f, 1);
-    add_loot(-33, -58, 3); add_loot(66.5f, 20, 3); add_loot(-65, -11.5f, 3); add_loot(70, 48, 3);  /* pecas de radio */
-    for (int i = 0; i < 8; i++) {
-        float x, z; int tries = 0;
-        do { x = (frand() * 2 - 1) * (WORLD - 6); z = (frand() * 2 - 1) * (WORLD - 6); } while (++tries < 30 && blocked(x, z, 3.0f));
-        add_loot(x, z, 0);
-    }
-    for (int i = 0; i < NTREES; i++) {
-        float x, z; int tries = 0;
-        do { x = (frand() * 2 - 1) * (WORLD - 3); z = (frand() * 2 - 1) * (WORLD - 3); } while (++tries < 40 && blocked(x, z, 4.0f));
-        treeX[i] = x; treeZ[i] = z; treeH[i] = 3.5f + frand() * 3.0f;
-    }
-    memset(zomb, 0, sizeof(zomb));
-    int zi = 0;
-    for (int zn = 0; zn < 5; zn++)
-        for (int k = 0; k < ZONES[zn].n && zi < NZREG; k++, zi++) {
-            Zomb *z = &zomb[zi];
-            z->hx = ZONES[zn].x; z->hz = ZONES[zn].z; z->hr = ZONES[zn].r; z->active = 1;
-            z->type = (k < ZONES[zn].brutes) ? 2 : (frand() < 0.3f ? 1 : 0);
-            respawn_zombie(z);
-        }
-    for (; zi < NZREG; zi++) {
-        Zomb *z = &zomb[zi];
-        float x, zz; int tries = 0;
-        do { x = (frand() * 2 - 1) * (WORLD - 8); zz = (frand() * 2 - 1) * (WORLD - 8); } while (++tries < 30 && (blocked(x, zz, 4.0f) || dist2d(x, zz, 0, 0) < 28.0f));
-        z->hx = x; z->hz = zz; z->hr = 10.0f; z->active = 1; z->type = (frand() < 0.3f) ? 1 : 0;
-        respawn_zombie(z);
-    }
-    /* armas coletaveis espalhadas pelo mundo */
-    static const float WP[7][3] = { { -8, -2, 1 }, { 56, 14.5f, 2 }, { -31, -52, 3 }, { 30, -37, 4 }, { 64, 44, 5 }, { -62, -11, 6 }, { 78.5f, 43.5f, 7 } };
-    for (int i = 0; i < 7; i++) { wpick[i].x = WP[i][0]; wpick[i].z = WP[i][1]; wpick[i].w = (int)WP[i][2]; wpick[i].taken = 0; }
-    for (int i = 7; i < NWP; i++) {
-        float x, zz; int tries = 0;
-        do { x = (frand() * 2 - 1) * (WORLD - 8); zz = (frand() * 2 - 1) * (WORLD - 8); } while (++tries < 30 && blocked(x, zz, 3.0f));
-        wpick[i].x = x; wpick[i].z = zz; wpick[i].w = 1 + (int)(frand() * 4.0f); if (wpick[i].w > 4) wpick[i].w = 4; wpick[i].taken = 0;
-    }
-}
-
-static void reset_state(void) {
-    memset(inv, 0, sizeof(inv));
-    inv[I_COM] = 2; inv[I_AGUA] = 2; inv[I_BAND] = 1; inv[I_MAD] = 2; inv[I_MUN] = 0;
-    for (int i = 0; i < NW; i++) hasW[i] = 0;
-    hasW[0] = 1; curW = 0; selUse = 0;
-    kills = 0; parts = 0; rescue = 0; deaths = 0; chasers = 0; mode = 0; menuSel = 0; showHelp = 1; endingSeen = 0;
-    px = 3.0f; pz = 5.0f; cam = 0; pang = 0;
-    hp = 100; hunger = 100; thirst = 100; stam = 100;
-    gameTime = 0; rescueT = 0; hordeT = 0; attackCD = 0; swingT = 0; rollT = 0; hurtT = 0; shotT = 0;
-    moanCD = 0; drinkCD = 0; msgTimer = 0; deathT = 0; msg[0] = 0; menuMsg[0] = 0;
-    facingRight = 1; moving = 0; walkPhase = 0;
-}
-
-/* ---------- salvar / carregar (3 slots) ---------- */
-#define SAVE_MAGIC  0x53564753u
-#define SAVE_MAGIC2 0x32565347u
-#define SAVE_DIR    "ms0:/PSP/SAVEDATA/SOBREVIVENDOGS"
-typedef struct {
-    unsigned int magic; int version;
-    int worldSeed, difficulty, nameIdx, kills, parts, rescue, curW, selUse, deaths, endingSeen;
-    int inv[NITEMS_OLD], hasW[3];
-    float px, pz, cam, gameTime, hp, hunger, thirst, stam, rescueT;
-    unsigned char looted[NLOOT]; float lootT[NLOOT];
-} SaveData;
-typedef struct { unsigned int magic; int inv2[2]; int hasW[NW]; int curW; unsigned char taken[NWP]; } SaveExtra;
-
-static void slot_path(int slot, char *out) { sprintf(out, SAVE_DIR "/save%d.dat", slot + 1); }
-
-static int save_game(void) {
-    SaveData d; memset(&d, 0, sizeof(d));
-    d.magic = SAVE_MAGIC; d.version = 1;
-    d.worldSeed = worldSeed; d.difficulty = difficulty; d.nameIdx = nameIdx; d.kills = kills; d.parts = parts;
-    d.rescue = rescue; d.selUse = selUse; d.deaths = deaths; d.endingSeen = endingSeen;
-    d.curW = (curW == 2) ? 1 : (curW == 4) ? 2 : 0;
-    for (int i = 0; i < NITEMS_OLD; i++) d.inv[i] = inv[i];
-    d.hasW[0] = hasW[1]; d.hasW[1] = hasW[2]; d.hasW[2] = hasW[4];
-    d.px = px; d.pz = pz; d.cam = cam; d.gameTime = gameTime; d.hp = hp; d.hunger = hunger; d.thirst = thirst;
-    d.stam = stam; d.rescueT = rescueT;
-    for (int i = 0; i < nloot && i < NLOOT; i++) { d.looted[i] = (unsigned char)loot[i].looted; d.lootT[i] = loot[i].t; }
-    SaveExtra e; memset(&e, 0, sizeof(e));
-    e.magic = SAVE_MAGIC2; e.inv2[0] = inv[I_CART]; e.inv2[1] = inv[I_RIFLE]; e.curW = curW;
-    for (int i = 0; i < NW; i++) e.hasW[i] = hasW[i];
-    for (int i = 0; i < NWP; i++) e.taken[i] = (unsigned char)wpick[i].taken;
-    sceIoMkdir("ms0:/PSP", 0777);
-    sceIoMkdir("ms0:/PSP/SAVEDATA", 0777);
-    sceIoMkdir(SAVE_DIR, 0777);
-    char path[96]; slot_path(curSlot, path);
-    int fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (fd < 0) return 0;
-    int w = sceIoWrite(fd, &d, sizeof(d));
-    int w2 = sceIoWrite(fd, &e, sizeof(e));
-    sceIoClose(fd);
-    return w == (int)sizeof(d) && w2 == (int)sizeof(e);
-}
-
-static int read_slot(int slot, SaveData *d, SaveExtra *e, int *hasE) {
-    char p[96]; slot_path(slot, p);
-    int fd = sceIoOpen(p, PSP_O_RDONLY, 0777);
-    if (fd < 0) return 0;
-    int r = sceIoRead(fd, d, sizeof(*d));
-    int r2 = sceIoRead(fd, e, sizeof(*e));
-    sceIoClose(fd);
-    *hasE = (r2 == (int)sizeof(*e) && e->magic == SAVE_MAGIC2);
-    return r == (int)sizeof(*d) && d->magic == SAVE_MAGIC && d->version == 1;
-}
-
-static void refresh_slots(void) {
-    for (int s = 0; s < 3; s++) {
-        SaveData d; SaveExtra e; int he; SlotInfo *si = &slotInfos[s]; memset(si, 0, sizeof(*si));
-        if (!read_slot(s, &d, &e, &he)) continue;
-        si->used = 1; si->nameIdx = (d.nameIdx >= 0 && d.nameIdx < 8) ? d.nameIdx : 0;
-        si->day = (int)((d.gameTime / DAY_LEN * 24.0f + 8.0f) / 24.0f) + 1; si->parts = d.parts; si->kills = d.kills;
-    }
-}
-
-static int load_game(void) {
-    SaveData d; SaveExtra e; int he = 0;
-    if (!read_slot(curSlot, &d, &e, &he)) return 0;
-    reset_state();
-    worldSeed = d.worldSeed; difficulty = (d.difficulty >= 0 && d.difficulty < 3) ? d.difficulty : 1;
-    nameIdx = (d.nameIdx >= 0 && d.nameIdx < 8) ? d.nameIdx : 0;
-    seed_rng = seed_for(worldSeed);
-    init_world();
-    kills = d.kills; parts = d.parts; rescue = (d.rescue == 1 || d.rescue == 2) ? 0 : d.rescue; selUse = d.selUse;
-    deaths = d.deaths; endingSeen = d.endingSeen ? 1 : 0;
-    for (int i = 0; i < NITEMS_OLD; i++) inv[i] = d.inv[i];
-    if (he) {
-        inv[I_CART] = e.inv2[0]; inv[I_RIFLE] = e.inv2[1];
-        for (int i = 0; i < NW; i++) hasW[i] = e.hasW[i] ? 1 : 0;
-        curW = e.curW;
-        for (int i = 0; i < NWP; i++) wpick[i].taken = e.taken[i] ? 1 : 0;
-    } else {
-        static const int mp[3] = { 1, 2, 4 };
-        hasW[1] = d.hasW[0]; hasW[2] = d.hasW[1]; hasW[4] = d.hasW[2];
-        curW = (d.curW >= 0 && d.curW < 3) ? mp[d.curW] : 0;
-    }
-    hasW[0] = 1;
-    if (curW < 0 || curW >= NW || !hasW[curW]) curW = 0;
-    if (selUse < 0 || selUse > 2) selUse = 0;
-    px = d.px; pz = d.pz; cam = d.cam; gameTime = d.gameTime; hp = d.hp; hunger = d.hunger; thirst = d.thirst;
-    stam = d.stam; rescueT = d.rescueT;
-    if (hp < 20) hp = 20;
-    for (int i = 0; i < nloot && i < NLOOT; i++) { loot[i].looted = d.looted[i] ? 1 : 0; loot[i].t = d.lootT[i]; }
+static int visible(float x, float z, float r)
+{
+    float dx = x - cam_x, dz = z - cam_z, rx, fh;
+    if (dx * dx + dz * dz < 144.0f) return 1;
+    rx = dx * cam_cs - dz * cam_sn;
+    fh = -dx * cam_sn - dz * cam_cs;
+    if (fh < -r) return 0;
+    if (fabsf(rx) > fh * 1.9f + r) return 0;
     return 1;
 }
 
-static void create_world(void) {
-    reset_state();
-    worldSeed = nwSeed ? nwSeed : (int)(sceKernelGetSystemTimeLow() % 99u) + 1;
-    nameIdx = nwName; difficulty = nwDiff; curSlot = nwSlot;
-    seed_rng = seed_for(worldSeed);
-    init_world();
-    save_game();
+static Vtx *put_quad(Vtx *v, const float *p, float u0, float v0, float u1, float v1, unsigned int c)
+{
+    setv(&v[0], p[0], p[1], p[2], u0, v1, c);
+    setv(&v[1], p[3], p[4], p[5], u1, v1, c);
+    setv(&v[2], p[6], p[7], p[8], u1, v0, c);
+    setv(&v[3], p[0], p[1], p[2], u0, v1, c);
+    setv(&v[4], p[6], p[7], p[8], u1, v0, c);
+    setv(&v[5], p[9], p[10], p[11], u0, v0, c);
+    return v + 6;
 }
 
-static void check_ending(void) {
-    endingSeen = 1; creditsFromGame = 1; appState = APP_CREDITS; creditsY = 272.0f; appT = 0; mode = 0;
-    rescue = 0; save_game();
+static void quad1(const float *p, float u0, float v0, float u1, float v1, unsigned int c)
+{
+    Vtx *v = (Vtx *)sceGuGetMemory(6 * sizeof(Vtx));
+    put_quad(v, p, u0, v0, u1, v1, c);
+    sceGuDrawArray(GU_TRIANGLES, VT3D, 6, 0, v);
 }
 
-/* ---------- jogador ---------- */
-static void open_loot(int i) {
-    static const int wt[7] = { 3, 3, 3, 2, 2, 1, 2 };   /* madeira sucata pano comida agua bandagem municao */
-    Loot *L = &loot[i]; int got[NITEMS]; memset(got, 0, sizeof(got)); int wdrop = -1;
-    if (L->kind == 0) {
-        int rolls = 2 + (frand() < 0.5f ? 1 : 0);
-        for (int r = 0; r < rolls; r++) {
-            float tot = 16.0f, v = frand() * tot, acc = 0; int it = 0;
-            for (int k = 0; k < 7; k++) { acc += wt[k]; if (v <= acc) { it = k; break; } it = k; }
-            got[it] += 1 + (it < 3 ? (int)(frand() * 2) : 0);
+/* caixa (sem fundo) com rotacao em Y; cx,cz = centro, by = base */
+static void box(float cx, float by, float cz, float sx, float sy, float sz, float yaw, unsigned int col)
+{
+    static const float k[4] = {0.78f, 0.62f, 0.88f, 0.70f};
+    float c = cosf(yaw), s = sinf(yaw), hx = sx * 0.5f, hz = sz * 0.5f, y1 = by + sy;
+    float lx[4], lz[4], X[4], Z[4];
+    Vtx *v, *w;
+    int i, j;
+    lx[0] = -hx; lx[1] = hx; lx[2] = hx; lx[3] = -hx;
+    lz[0] = -hz; lz[1] = -hz; lz[2] = hz; lz[3] = hz;
+    for (i = 0; i < 4; i++) { X[i] = cx + lx[i] * c + lz[i] * s; Z[i] = cz - lx[i] * s + lz[i] * c; }
+    v = (Vtx *)sceGuGetMemory(30 * sizeof(Vtx));
+    w = v;
+    for (i = 0; i < 4; i++) {
+        float p[12];
+        j = (i + 1) & 3;
+        p[0] = X[i]; p[1] = by; p[2] = Z[i]; p[3] = X[j]; p[4] = by; p[5] = Z[j];
+        p[6] = X[j]; p[7] = y1; p[8] = Z[j]; p[9] = X[i]; p[10] = y1; p[11] = Z[i];
+        w = put_quad(w, p, 0, 0, 1, 1, shade(col, k[i]));
+    }
+    {
+        float p[12];
+        p[0] = X[0]; p[1] = y1; p[2] = Z[0]; p[3] = X[1]; p[4] = y1; p[5] = Z[1];
+        p[6] = X[2]; p[7] = y1; p[8] = Z[2]; p[9] = X[3]; p[10] = y1; p[11] = Z[3];
+        put_quad(w, p, 0, 0, 1, 1, col);
+    }
+    sceGuDrawArray(GU_TRIANGLES, VT3D, 30, 0, v);
+}
+
+static void box_rel(float px, float pz, float yaw, float ox, float by, float oz, float sx, float sy, float sz, unsigned int col)
+{
+    float c = cosf(yaw), s = sinf(yaw);
+    box(px + ox * c + oz * s, by, pz - ox * s + oz * c, sx, sy, sz, yaw, col);
+}
+
+/*------------------------------ 2D / texto --------------------------*/
+static void begin2d(void)
+{
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuDisable(GU_FOG);
+    sceGuDisable(GU_ALPHA_TEST);
+    sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+}
+
+static void rect(float x, float y, float w, float h, unsigned int col)
+{
+    Vtx *v;
+    sceGuDisable(GU_TEXTURE_2D);
+    v = (Vtx *)sceGuGetMemory(2 * sizeof(Vtx));
+    v[0].u = 0; v[0].v = 0; v[0].c = col; v[0].x = x; v[0].y = y; v[0].z = 0;
+    v[1].u = 0; v[1].v = 0; v[1].c = col; v[1].x = x + w; v[1].y = y + h; v[1].z = 0;
+    sceGuDrawArray(GU_SPRITES, VT2D, 2, 0, v);
+}
+
+static void gradient(float y0, float y1, unsigned int top, unsigned int bot)
+{
+    Vtx *v;
+    sceGuDisable(GU_TEXTURE_2D);
+    v = (Vtx *)sceGuGetMemory(4 * sizeof(Vtx));
+    v[0].u = 0; v[0].v = 0; v[0].c = top; v[0].x = 0;     v[0].y = y0; v[0].z = 0;
+    v[1].u = 0; v[1].v = 0; v[1].c = top; v[1].x = SCR_W; v[1].y = y0; v[1].z = 0;
+    v[2].u = 0; v[2].v = 0; v[2].c = bot; v[2].x = 0;     v[2].y = y1; v[2].z = 0;
+    v[3].u = 0; v[3].v = 0; v[3].c = bot; v[3].x = SCR_W; v[3].y = y1; v[3].z = 0;
+    sceGuDrawArray(GU_TRIANGLE_STRIP, VT2D, 4, 0, v);
+}
+
+static void spr2d(int tex, float x, float y, float w, float h, int flip, unsigned int col)
+{
+    Vtx *v;
+    tex_bind(tex, 0, 0);
+    v = (Vtx *)sceGuGetMemory(2 * sizeof(Vtx));
+    v[0].u = flip ? 1.0f : 0.0f; v[0].v = 0; v[0].c = col; v[0].x = x;     v[0].y = y;     v[0].z = 0;
+    v[1].u = flip ? 0.0f : 1.0f; v[1].v = 1; v[1].c = col; v[1].x = x + w; v[1].y = y + h; v[1].z = 0;
+    sceGuDrawArray(GU_SPRITES, VT2D, 2, 0, v);
+}
+
+/* texto: usa a fonte do pspdebug, impressa depois do GU terminar o quadro */
+typedef struct { short x, y; unsigned int col; char s[72]; } TextItem;
+static TextItem tq[110];
+static int ntq = 0;
+
+static void text(int x, int y, unsigned int col, const char *fmt, ...)
+{
+    va_list ap;
+    if (ntq >= 110) return;
+    va_start(ap, fmt);
+    vsnprintf(tq[ntq].s, 72, fmt, ap);
+    va_end(ap);
+    tq[ntq].x = (short)x; tq[ntq].y = (short)y; tq[ntq].col = col;
+    ntq++;
+}
+
+static void textc(int y, unsigned int col, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    if (ntq >= 110) return;
+    va_start(ap, fmt);
+    vsnprintf(tq[ntq].s, 72, fmt, ap);
+    va_end(ap);
+    n = (int)strlen(tq[ntq].s);
+    tq[ntq].x = (short)((SCR_W - n * 8) / 2); tq[ntq].y = (short)y; tq[ntq].col = col;
+    ntq++;
+}
+
+static void text_flush(void)
+{
+    int i;
+    pspDebugScreenSetOffset(draw_off);
+    for (i = 0; i < ntq; i++) {
+        pspDebugScreenSetXY(tq[i].x / 8, tq[i].y / 8);
+        pspDebugScreenSetTextColor(tq[i].col);
+        pspDebugScreenPuts(tq[i].s);
+    }
+    ntq = 0;
+}
+
+/* fonte grande 3x5 (so as letras usadas nos titulos) */
+static const char *glyph(char c)
+{
+    switch (c) {
+    case 'S': return "111100111001111";
+    case 'O': return "111101101101111";
+    case 'B': return "110101110101110";
+    case 'R': return "110101110101101";
+    case 'E': return "111100110100111";
+    case 'V': return "101101101101010";
+    case 'I': return "111010010010111";
+    case 'N': return "101111111111101";
+    case 'D': return "110101101101110";
+    case 'M': return "101111111101101";
+    case 'G': return "111100101101111";
+    case 'L': return "100100100100111";
+    case 'J': return "001001001101111";
+    case 'A': return "111101111101101";
+    case 'C': return "111100100100111";
+    case 'U': return "101101101101111";
+    default: return NULL;
+    }
+}
+
+static int big_w(const char *s, int sc) { return (int)strlen(s) * 4 * sc - sc; }
+
+static void big_text(int x, int y, int sc, unsigned int col, const char *s)
+{
+    int pass, i, k;
+    for (pass = 0; pass < 2; pass++) {
+        int cx = x + (pass == 0 ? sc : 0), cy = y + (pass == 0 ? sc : 0);
+        unsigned int cc = pass == 0 ? RGBA(0, 0, 0, 200) : col;
+        for (i = 0; s[i]; i++) {
+            const char *g = glyph(s[i]);
+            if (g)
+                for (k = 0; k < 15; k++)
+                    if (g[k] == '1') rect((float)(cx + (k % 3) * sc), (float)(cy + (k / 3) * sc), (float)sc, (float)sc, cc);
+            cx += 4 * sc;
         }
-    } else if (L->kind == 1) {
-        got[I_SUC] = 1 + (int)(frand() * 3);
-        if (frand() < 0.4f) got[I_MUN] = 2 + (int)(frand() * 3);
-        if (frand() < 0.25f) got[I_COM] = 1;
-    } else if (L->kind == 2) {
-        got[I_MUN] = 5 + (int)(frand() * 6);
-        if (frand() < 0.6f) got[I_BAND] = 1;
-        got[frand() < 0.5f ? I_COM : I_AGUA] = 1; got[I_SUC] += 1;
-        if (frand() < 0.15f) { int c = 4 + (int)(frand() * 4.0f); if (c > 7) c = 7; if (!hasW[c]) wdrop = c; }
-    } else {
-        got[I_PECA] = 1; got[I_MUN] = 2 + (int)(frand() * 3); got[I_BAND] = 1;
     }
-    char b[64]; b[0] = 0; int n = 0;
-    for (int k = 0; k < NITEMS; k++) if (got[k]) {
-        inv[k] += got[k]; if (k == I_PECA) parts++;
-        char t[24]; sprintf(t, "%s%d %s", n ? ", " : "", got[k], itemName[k]);
-        if (strlen(b) + strlen(t) < 40) strcat(b, t);
-        n++;
+}
+
+/*------------------------------ entrada -----------------------------*/
+typedef struct { unsigned int b, p; float mx, my, lx, ly; } Input;
+static SceCtrlData pad;
+static unsigned int pad_old = 0;
+
+static float deadz(float v)
+{
+    if (fabsf(v) < 0.22f) return 0.0f;
+    return (v > 0 ? v - 0.22f : v + 0.22f) / 0.78f;
+}
+
+static void read_input(Input *in)
+{
+    unsigned int b;
+    sceCtrlPeekBufferPositive(&pad, 1);
+    b = pad.Buttons;
+    in->b = b; in->p = b & ~pad_old; pad_old = b;
+    in->mx = deadz(((int)pad.Lx - 128) / 128.0f);
+    in->my = -deadz(((int)pad.Ly - 128) / 128.0f);
+    in->lx = (float)((b & PSP_CTRL_RIGHT) ? 1 : 0) - (float)((b & PSP_CTRL_LEFT) ? 1 : 0);
+    in->ly = (float)((b & PSP_CTRL_UP) ? 1 : 0) - (float)((b & PSP_CTRL_DOWN) ? 1 : 0);
+}
+
+/*------------------------------ save --------------------------------*/
+typedef struct {
+    unsigned int magic; int money; int wown[3]; int cown[CAR_COUNT]; int selcar;
+    int total[3]; int medkits; int best_wave; int best_kills;
+} Save;
+static Save sv;
+#define SAVE_MAGIC 0x53475331u
+#define SAVE_DIR "ms0:/PSP/GAME/SobrevivendoEmGS"
+#define SAVE_PATH SAVE_DIR "/save.bin"
+
+static void save_defaults(void)
+{
+    memset(&sv, 0, sizeof(sv));
+    sv.magic = SAVE_MAGIC; sv.money = 500; sv.wown[0] = 1; sv.cown[0] = 1; sv.total[0] = 48; sv.medkits = 1;
+}
+static void save_load(void)
+{
+    int fd;
+    save_defaults();
+    fd = sceIoOpen(SAVE_PATH, PSP_O_RDONLY, 0);
+    if (fd >= 0) {
+        Save t;
+        int n = sceIoRead(fd, &t, sizeof(t));
+        sceIoClose(fd);
+        if (n == (int)sizeof(t) && t.magic == SAVE_MAGIC) sv = t;
     }
-    if (wdrop >= 0) {
-        hasW[wdrop] = 1; curW = wdrop; if (wAmmo[wdrop] >= 0) inv[wAmmo[wdrop]] += wGive[wdrop];
-        char t[24]; sprintf(t, "%s%s", n ? ", " : "", wName[wdrop]); if (strlen(b) + strlen(t) < 40) strcat(b, t);
-    }
-    char m[64]; sprintf(m, "Achou: %s", b[0] ? b : "nada");
-    say(m); L->looted = 1; L->t = (L->kind == 3) ? 1e9f : 600.0f; play_sfx(L->kind == 3 ? 11 : 9);
+}
+static void save_write(void)
+{
+    int fd;
+    sceIoMkdir(SAVE_DIR, 0777);
+    fd = sceIoOpen(SAVE_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd >= 0) { sceIoWrite(fd, &sv, sizeof(sv)); sceIoClose(fd); }
 }
 
-static void player_die(void) {
-    mode = 3; deathT = 0; deaths++; play_sfx(10);
+/*------------------------------ mundo -------------------------------*/
+typedef struct { float x0, z0, x1, z1, h; unsigned int col; int kind; } Bld; /* kind 0 predio, 1 caixote */
+typedef struct { float x, z, s; unsigned int col; } Tree;
+static Bld blds[MAX_BLD];
+static int nbld = 0;
+static Tree trees[MAX_TREES];
+static int ntree = 0;
+static float camps[MAX_CAMPS][2];
+static int ncamps = 0;
+
+static void add_bld(float x0, float z0, float x1, float z1, float h, unsigned int col, int kind)
+{
+    if (nbld >= MAX_BLD) return;
+    blds[nbld].x0 = x0; blds[nbld].z0 = z0; blds[nbld].x1 = x1; blds[nbld].z1 = z1;
+    blds[nbld].h = h; blds[nbld].col = col; blds[nbld].kind = kind;
+    nbld++;
+}
+static void add_tree(float x, float z)
+{
+    int g;
+    if (ntree >= MAX_TREES) return;
+    g = (int)frange(70, 120);
+    trees[ntree].x = x; trees[ntree].z = z; trees[ntree].s = frange(0.8f, 1.4f);
+    trees[ntree].col = RGB(30 + g / 6, g, 40 + g / 8);
+    ntree++;
 }
 
-static void hurt_player(float dmg) {
-    if (rollT > 0 || mode == 3) return;
-    hp -= dmg * diffDmg[difficulty]; hurtT = 0.4f; play_sfx(6);
-    if (hp <= 0) { hp = 0; player_die(); }
-}
-
-static void kill_zombie(Zomb *z) {
-    z->state = 2; z->dead = 90.0f + frand() * 60.0f; z->corpse = 3.5f; kills++; play_sfx(3);
-    if (z->type == 2) { int it = (frand() < 0.5f) ? I_MUN : I_CART; inv[it] += 3; char mm[48]; sprintf(mm, "Brutamontes caiu! +3 %s", itemName[it]); say(mm); }
-    if (frand() < 0.45f) {
-        int it = (int)(frand() * 5); static const int tbl[5] = { I_PANO, I_SUC, I_COM, I_MUN, I_MAD };
-        inv[tbl[it]]++; char m[48]; sprintf(m, "Zumbi derrubado! +1 %s", itemName[tbl[it]]); say(m);
-    }
-    if (z->horde) z->active = 0;
-}
-
-static void damage_zombie(Zomb *z, float dmg, float fx, float fz) {
-    z->hp -= dmg; z->hurt = 0.3f; z->x += fx * 0.8f; z->z += fz * 0.8f; z->state = 1;
-    if (z->hp <= 0) kill_zombie(z); else play_sfx(3);
-}
-
-static int nearest_zombie(float maxd, float *outd) {
-    int best = -1; float bd = maxd;
-    for (int i = 0; i < NZ; i++) {
-        Zomb *z = &zomb[i];
-        if (!z->active || z->state == 2) continue;
-        float d = dist2d(px, pz, z->x, z->z);
-        if (d < bd) { bd = d; best = i; }
-    }
-    if (outd) *outd = bd;
-    return best;
-}
-
-static int aim_target(float maxd, float maxAng) {
-    int best = -1; float bd = maxd;
-    for (int i = 0; i < NZ; i++) {
-        Zomb *z = &zomb[i];
-        if (!z->active || z->state == 2) continue;
-        float dx = z->x - px, dz = z->z - pz, d = sqrtf(dx * dx + dz * dz);
-        float da = atan2f(dx, dz) - pang;
-        while (da > PI_F) da -= 2.0f * PI_F;
-        while (da < -PI_F) da += 2.0f * PI_F;
-        if (d < bd && fabsf(da) < maxAng) { bd = d; best = i; }
-    }
-    return best;
-}
-
-static float ray_hit(float fx, float fz, float rng, int *hit) {
-    float bt = rng; *hit = -1;
-    for (int i = 0; i < NZ; i++) {
-        Zomb *z = &zomb[i];
-        if (!z->active || z->state == 2) continue;
-        float dx = z->x - px, dz = z->z - pz, along = dx * fx + dz * fz, perp = fabsf(dx * fz - dz * fx);
-        if (along > 0 && along < bt && perp < 0.9f) { bt = along; *hit = i; }
-    }
-    return bt;
-}
-
-static void player_attack(void) {
-    if (attackCD > 0 || rollT > 0 || mode != 0) return;
-    int w = curW, ai = wAmmo[w];
-    float rng = wRange[w];
-    if (ai >= 0 && inv[ai] <= 0) { say("Sem municao!"); play_sfx(10); attackCD = 0.3f; return; }
-    int t = aim_target(ai >= 0 ? rng : 3.8f, ai >= 0 ? 1.1f : 3.2f);
-    if (t >= 0) pang = atan2f(zomb[t].x - px, zomb[t].z - pz);
-    float fx = sinf(pang), fz = cosf(pang);
-    attackCD = wCD[w];
-    if (ai >= 0) {
-        inv[ai]--; play_sfx(1); shotT = 0.1f;
-        int hit; float bt;
-        if (w == 6) {
-            static const float off[5] = { -0.16f, -0.08f, 0.0f, 0.08f, 0.16f };
-            bt = rng;
-            for (int k = 0; k < 5; k++) {
-                float a2 = pang + off[k], gx = sinf(a2), gz = cosf(a2); int h2;
-                float t2 = ray_hit(gx, gz, rng, &h2);
-                if (k == 2) { bt = t2; fx = gx; fz = gz; }
-                if (h2 >= 0) damage_zombie(&zomb[h2], wDmg[w], gx, gz);
+static void world_gen_static(void)
+{
+    static const unsigned int pal[6] = {
+        RGB(215, 205, 190), RGB(190, 180, 170), RGB(200, 170, 150),
+        RGB(170, 175, 185), RGB(210, 195, 150), RGB(160, 150, 145)};
+    int bx, bz, i, j, k;
+    rng_state = 20240607u;
+    nbld = 0; ntree = 0; ncamps = 0;
+    for (bx = -4; bx < 4; bx++)
+        for (bz = -4; bz < 4; bz++) {
+            float x0 = bx * 100.0f + 10.0f, z0 = bz * 100.0f + 10.0f, r = frand();
+            if (bx == 0 && bz == 0) { /* praca inicial */
+                camps[ncamps][0] = 38.0f; camps[ncamps][1] = 36.0f; ncamps++;
+                add_bld(30, 28, 32.4f, 30.4f, 1.3f, RGB(110, 80, 50), 1);
+                add_bld(44, 30, 46.4f, 32.4f, 1.3f, RGB(110, 80, 50), 1);
+                for (k = 0; k < 10; k++) add_tree(frange(14, 86), frange(14, 24));
+                continue;
             }
-        } else {
-            bt = ray_hit(fx, fz, rng, &hit);
-            if (hit >= 0) damage_zombie(&zomb[hit], wDmg[w], fx, fz);
-        }
-        shotX1 = px + fx * 0.8f; shotZ1 = pz + fz * 0.8f; shotX2 = px + fx * bt; shotZ2 = pz + fz * bt;
-    } else {
-        swingT = 0.18f; play_sfx(2);
-        for (int i = 0; i < NZ; i++) {
-            Zomb *z = &zomb[i];
-            if (!z->active || z->state == 2) continue;
-            float dx = z->x - px, dz = z->z - pz, d = sqrtf(dx * dx + dz * dz);
-            if (d < rng + 0.6f && (d < 0.3f || (dx * fx + dz * fz) / d > 0.2f)) damage_zombie(z, wDmg[w], fx, fz);
-        }
-    }
-}
-
-static int nearest_wpick(void) {
-    int best = -1; float bd = 2.6f;
-    for (int i = 0; i < NWP; i++) {
-        if (wpick[i].taken) continue;
-        float d = dist2d(px, pz, wpick[i].x, wpick[i].z);
-        if (d < bd) { bd = d; best = i; }
-    }
-    return best;
-}
-
-static void take_weapon(int i) {
-    int w = wpick[i].w; char m[64];
-    wpick[i].taken = 1;
-    if (wAmmo[w] >= 0) inv[wAmmo[w]] += wGive[w];
-    if (!hasW[w]) { hasW[w] = 1; curW = w; sprintf(m, "Pegou: %s!", wName[w]); }
-    else sprintf(m, "Ja tem %s: +%d %s", wName[w], wGive[w], wAmmo[w] >= 0 ? itemName[wAmmo[w]] : "nada");
-    say(m); play_sfx(9);
-}
-
-static void use_item(void) {
-    if (selUse == 0) { if (inv[I_COM] > 0) { inv[I_COM]--; hunger += 35; if (hunger > 100) hunger = 100; say("Comeu. Fome restaurada."); play_sfx(4); } else { say("Sem comida!"); play_sfx(10); } }
-    else if (selUse == 1) { if (inv[I_AGUA] > 0) { inv[I_AGUA]--; thirst += 40; if (thirst > 100) thirst = 100; say("Bebeu agua."); play_sfx(4); } else { say("Sem agua!"); play_sfx(10); } }
-    else { if (inv[I_BAND] > 0) { inv[I_BAND]--; hp += 40; if (hp > 100) hp = 100; say("Usou bandagem. Vida restaurada."); play_sfx(4); } else { say("Sem bandagem!"); play_sfx(10); } }
-}
-
-static int near_camp(void) { return NEAR(BASE_X, BASE_Z, 4.5f); }
-static int near_lake(void) { return lake_dist(px, pz) < 3.0f; }
-static int near_heli(void) { return rescue == 2 && NEAR(HELI_X, HELI_Z, 6.0f); }
-static int nearest_loot(void) {
-    int best = -1; float bd = 2.6f;
-    for (int i = 0; i < nloot; i++) {
-        if (loot[i].looted) continue;
-        float d = dist2d(px, pz, loot[i].x, loot[i].z);
-        if (d < bd) { bd = d; best = i; }
-    }
-    return best;
-}
-
-static void interact(void) {
-    int l;
-    if (near_heli()) { play_sfx(12); check_ending(); return; }
-    if (near_camp()) { mode = 2; menuSel = 0; menuMsg[0] = 0; play_sfx(5); return; }
-    l = nearest_wpick();
-    if (l >= 0) { take_weapon(l); return; }
-    l = nearest_loot();
-    if (l >= 0) { open_loot(l); return; }
-    if (near_lake()) {
-        if (drinkCD > 0) return;
-        thirst += 30; if (thirst > 100) thirst = 100; drinkCD = 1.0f; say("Bebeu agua do lago."); play_sfx(4); return;
-    }
-    say("Nada para fazer aqui."); play_sfx(10);
-}
-
-/* ---------- zumbis ---------- */
-static void zombies_update(float dt) {
-    float night = nightness();
-    float aggro = 14.0f + 12.0f * night;
-    int inSafe = (rescue == 0) && dist2d(px, pz, BASE_X, BASE_Z) < SAFE_R;
-    chasers = 0;
-    if (moanCD > 0) moanCD -= dt;
-    for (int i = 0; i < NZ; i++) {
-        Zomb *z = &zomb[i];
-        if (!z->active) continue;
-        if (z->state == 2) {
-            if (z->corpse > 0) z->corpse -= dt;
-            z->dead -= dt;
-            if (z->dead <= 0 && i < NZREG) { z->state = 0; respawn_zombie(z); }
-            continue;
-        }
-        if (z->hurt > 0) z->hurt -= dt;
-        if (z->atk > 0) z->atk -= dt;
-        float dx = px - z->x, dz = pz - z->z, d = sqrtf(dx * dx + dz * dz);
-        float sp = zSpeed[z->type] * diffSpd[difficulty] * (1.0f + 0.15f * night);
-        if (z->hurt > 0.15f) continue;
-        if (z->state == 0) {
-            z->t -= dt;
-            if (z->t <= 0) { z->tx = z->hx + (frand() * 2 - 1) * z->hr; z->tz = z->hz + (frand() * 2 - 1) * z->hr; z->t = 3.0f + frand() * 4.0f; }
-            float tx = z->tx - z->x, tz = z->tz - z->z, td = sqrtf(tx * tx + tz * tz);
-            if (td > 0.6f) { z->x += tx / td * 1.1f * dt; z->z += tz / td * 1.1f * dt; z->ang = atan2f(tx, tz); }
-            if (!inSafe && d < aggro * (z->type == 1 ? 1.2f : 1.0f)) {
-                z->state = 1;
-                if (moanCD <= 0 && d < 20.0f) { play_sfx(7); moanCD = 4.0f; }
-            }
-        } else {
-            if (inSafe || (!z->horde && d > aggro * 2.0f)) z->state = 0;
-            else {
-                if (d > 1.0f) { z->x += dx / d * sp * dt; z->z += dz / d * sp * dt; } if (d > 0.01f) z->ang = atan2f(dx, dz);
-                if (d < 1.7f && z->atk <= 0) { z->atk = 1.0f; hurt_player(zDmg[z->type]); }
-                if (d < 22.0f) chasers++;
-            }
-        }
-        collide(&z->x, &z->z, 0.5f);
-        if (rescue == 0) {
-            float bd = dist2d(z->x, z->z, BASE_X, BASE_Z);
-            if (bd < SAFE_R && bd > 0.001f) { z->x = BASE_X + (z->x - BASE_X) / bd * SAFE_R; z->z = BASE_Z + (z->z - BASE_Z) / bd * SAFE_R; }
-        }
-    }
-}
-
-static void spawn_horde(int n) {
-    for (int i = NZREG; i < NZ && n > 0; i++) {
-        Zomb *z = &zomb[i];
-        if (z->active) continue;
-        float a = frand() * 6.283f;
-        z->x = BASE_X + cosf(a) * 38.0f; z->z = BASE_Z + sinf(a) * 38.0f;
-        z->hx = BASE_X; z->hz = BASE_Z; z->hr = 8.0f;
-        z->type = (frand() < 0.3f) ? 1 : 0; z->hp = zHP[z->type]; z->state = 1; z->active = 1; z->horde = 1; z->hurt = 0; z->atk = 0;
-        n--;
-    }
-}
-
-static void do_sleep(void) {
-    float hrs = gameTime / DAY_LEN * 24.0f + 8.0f;
-    float target = (floorf((hrs - 7.0f) / 24.0f) + 1.0f) * 24.0f + 7.0f;
-    float skip = (target - hrs) / 24.0f * DAY_LEN;
-    gameTime += skip;
-    hp += 60; if (hp > 100) hp = 100;
-    hunger -= 15; if (hunger < 5) hunger = 5;
-    thirst -= 20; if (thirst < 5) thirst = 5;
-    for (int i = 0; i < nloot; i++) if (loot[i].looted && loot[i].kind != 3) { loot[i].t -= skip; if (loot[i].t <= 0) loot[i].looted = 0; }
-    for (int i = 0; i < NZREG; i++) if (zomb[i].active && zomb[i].state == 2) { zomb[i].state = 0; respawn_zombie(&zomb[i]); }
-    say(save_game() ? "Dormiu. Novo dia! Jogo salvo." : "Dormiu. Novo dia! (erro ao salvar)");
-    play_sfx(4);
-}
-
-
-static void camp_update(unsigned int pressed) {
-    if (pressed & PSP_CTRL_UP)   { menuSel = (menuSel + 6) % 7; play_sfx(5); }
-    if (pressed & PSP_CTRL_DOWN) { menuSel = (menuSel + 1) % 7; play_sfx(5); }
-    if (pressed & (PSP_CTRL_START | PSP_CTRL_CIRCLE | PSP_CTRL_TRIANGLE)) { mode = 0; return; }
-    if (pressed & PSP_CTRL_CROSS) {
-        if (menuSel == 0) {
-            if (inv[I_PANO] >= 2) { inv[I_PANO] -= 2; inv[I_BAND]++; strcpy(menuMsg, "Fabricou 1 Bandagem!"); play_sfx(4); }
-            else { strcpy(menuMsg, "Faltam materiais!"); play_sfx(10); }
-        } else if (menuSel == 1) {
-            if (inv[I_SUC] >= 2) { inv[I_SUC] -= 2; inv[I_MUN] += 6; strcpy(menuMsg, "Fabricou 6 Municao!"); play_sfx(4); }
-            else { strcpy(menuMsg, "Faltam materiais!"); play_sfx(10); }
-        } else if (menuSel == 2) {
-            if (inv[I_SUC] >= 3) { inv[I_SUC] -= 3; inv[I_CART] += 4; strcpy(menuMsg, "Fabricou 4 Cartuchos!"); play_sfx(4); }
-            else { strcpy(menuMsg, "Faltam materiais!"); play_sfx(10); }
-        } else if (menuSel == 3) {
-            if (inv[I_SUC] >= 4) { inv[I_SUC] -= 4; inv[I_RIFLE] += 3; strcpy(menuMsg, "Fabricou 3 Balas de rifle!"); play_sfx(4); }
-            else { strcpy(menuMsg, "Faltam materiais!"); play_sfx(10); }
-        } else if (menuSel == 4) {
-            do_sleep(); mode = 0;
-        } else if (menuSel == 5) {
-            if (rescue != 0) { strcpy(menuMsg, "O resgate ja foi chamado!"); play_sfx(10); }
-            else if (parts < 4) { sprintf(menuMsg, "Faltam %d pecas de radio!", 4 - parts); play_sfx(10); }
-            else { rescue = 1; rescueT = 100.0f; hordeT = 3.0f; mode = 0; say("Resgate chamado! Aguente 100 segundos!"); play_sfx(11); }
-        } else mode = 0;
-    }
-}
-
-static void pause_update(unsigned int pressed) {
-    if (pressed & PSP_CTRL_UP)   { menuSel = (menuSel + 5) % 6; play_sfx(5); }
-    if (pressed & PSP_CTRL_DOWN) { menuSel = (menuSel + 1) % 6; play_sfx(5); }
-    if (pressed & (PSP_CTRL_START | PSP_CTRL_CIRCLE)) { mode = 0; return; }
-    if (pressed & PSP_CTRL_CROSS) {
-        if (menuSel == 0) mode = 0;
-        else if (menuSel == 1) { musicOn = !musicOn; play_sfx(5); }
-        else if (menuSel == 2) strcpy(menuMsg, save_game() ? "Jogo salvo!" : "Erro ao salvar!");
-        else if (menuSel == 3) {
-            if (save_game()) { mode = 0; appState = APP_TITLE; titleSel = 0; }
-            else strcpy(menuMsg, "Erro ao salvar!");
-        } else if (menuSel == 4) { mode = 0; appState = APP_TITLE; titleSel = 0; }
-        else running = 0;
-    }
-}
-
-static void death_update(float dt, unsigned int pressed) {
-    deathT += dt;
-    if (deathT > 1.2f && (pressed & PSP_CTRL_CROSS)) {
-        for (int i = 0; i < NITEMS; i++) inv[i] = inv[i] / 2;
-        hp = 60; hunger = hunger < 40 ? 40 : hunger; thirst = thirst < 40 ? 40 : thirst; stam = 100;
-        px = 3.0f; pz = 5.0f; rollT = 0; hurtT = 0; mode = 0; say("Voce renasceu no acampamento.");
-        for (int i = 0; i < NZ; i++) if (zomb[i].active && zomb[i].state == 1 && dist2d(px, pz, zomb[i].x, zomb[i].z) < 20.0f) zomb[i].state = 0;
-    }
-}
-
-static void update(float dt, const SceCtrlData *pad, unsigned int pressed) {
-    gameTime += dt;
-    if (msgTimer > 0) msgTimer -= dt;
-    if (attackCD > 0) attackCD -= dt;
-    if (swingT > 0) swingT -= dt;
-    if (shotT > 0) shotT -= dt;
-    if (hurtT > 0) hurtT -= dt;
-    if (drinkCD > 0) drinkCD -= dt;
-
-    if (pad->Buttons & PSP_CTRL_LTRIGGER) cam -= 1.8f * dt;
-    if (pad->Buttons & PSP_CTRL_RTRIGGER) cam += 1.8f * dt;
-
-    float dx = (pad->Lx - 128) / 128.0f, dy = (pad->Ly - 128) / 128.0f;
-    if (fabsf(dx) < 0.2f) dx = 0;
-    if (fabsf(dy) < 0.2f) dy = 0;
-    float mx = 0, mz = 0;
-    moving = (dx != 0 || dy != 0);
-    if (moving) {
-        float fx = sinf(cam), fz = cosf(cam), rx = -cosf(cam), rz = sinf(cam);
-        mx = fx * (-dy) + rx * dx; mz = fz * (-dy) + rz * dx;
-        float l = sqrtf(mx * mx + mz * mz); if (l > 1.0f) { mx /= l; mz /= l; }
-    }
-    if ((pressed & PSP_CTRL_CIRCLE) && rollT <= 0 && stam >= 25.0f) {
-        float l = sqrtf(mx * mx + mz * mz);
-        if (l > 0.1f) { rollX = mx / l; rollZ = mz / l; } else { rollX = sinf(pang); rollZ = cosf(pang); }
-        rollT = 0.32f; stam -= 25.0f; play_sfx(8);
-    }
-    if (rollT > 0) { rollT -= dt; mx = rollX * 1.9f; mz = rollZ * 1.9f; }
-    if (mx != 0 || mz != 0) {
-        float sp = 7.5f * dt;
-        px += mx * sp; pz += mz * sp;
-        if (px < -WORLD) px = -WORLD;
-        if (px > WORLD) px = WORLD;
-        if (pz < -WORLD) pz = -WORLD;
-        if (pz > WORLD) pz = WORLD;
-        collide(&px, &pz, 0.5f); collide_trees(&px, &pz);
-        pang = atan2f(mx, mz);
-        float rx = -cosf(cam), rz = sinf(cam), side = mx * rx + mz * rz;
-        if (side > 0.15f) facingRight = 1; else if (side < -0.15f) facingRight = 0;
-        walkPhase += dt * 8.0f;
-    } else walkPhase = 0;
-    stam += 16.0f * dt; if (stam > 100) stam = 100;
-
-    hunger -= 0.10f * dt; thirst -= 0.15f * dt;
-    if (hunger < 0) hunger = 0;
-    if (thirst < 0) thirst = 0;
-    if (hunger <= 0 || thirst <= 0) {
-        hp -= 1.5f * dt;
-        if (hp <= 0) { hp = 0; player_die(); return; }
-    } else if (hunger > 40 && thirst > 40 && hp < 100) { hp += 0.5f * dt; if (hp > 100) hp = 100; }
-
-    for (int i = 0; i < nloot; i++) if (loot[i].looted && loot[i].kind != 3) { loot[i].t -= dt; if (loot[i].t <= 0) loot[i].looted = 0; }
-
-    if (rescue == 1) {
-        rescueT -= dt; hordeT -= dt;
-        if (hordeT <= 0) { spawn_horde(2); hordeT = 7.0f; }
-        if (rescueT <= 0) { rescue = 2; rescueT = 90.0f; say("O helicoptero chegou! Va ate ele (X)!"); play_sfx(12); }
-    } else if (rescue == 2) {
-        rescueT -= dt;
-        if (rescueT <= 0) { rescue = 0; say("O helicoptero foi embora... chame de novo."); }
-    }
-    zombies_update(dt);
-
-    if (pressed & PSP_CTRL_LEFT)  { selUse = (selUse + 2) % 3; play_sfx(5); }
-    if (pressed & PSP_CTRL_RIGHT) { selUse = (selUse + 1) % 3; play_sfx(5); }
-    if (pressed & PSP_CTRL_UP) use_item();
-    if (pressed & PSP_CTRL_SELECT) showHelp = !showHelp;
-    if (pressed & PSP_CTRL_TRIANGLE) {
-        for (int k = 1; k <= NW; k++) { int w = (curW + k) % NW; if (hasW[w]) { curW = w; break; } }
-        char m[40]; sprintf(m, "Arma: %s", wName[curW]); say(m); play_sfx(5);
-    }
-    if ((pressed & PSP_CTRL_SQUARE) || ((pad->Buttons & PSP_CTRL_SQUARE) && wAuto[curW])) player_attack();
-    if (pressed & PSP_CTRL_CROSS) interact();
-    if (pressed & PSP_CTRL_START) { mode = 1; menuSel = 0; menuMsg[0] = 0; }
-}
-
-static const unsigned char font5x7[95][5] = {
-    {0x00,0x00,0x00,0x00,0x00},
-    {0x00,0x00,0x5F,0x00,0x00},
-    {0x00,0x07,0x00,0x07,0x00},
-    {0x14,0x7F,0x14,0x7F,0x14},
-    {0x24,0x2A,0x7F,0x2A,0x12},
-    {0x23,0x13,0x08,0x64,0x62},
-    {0x36,0x49,0x56,0x20,0x50},
-    {0x00,0x08,0x07,0x03,0x00},
-    {0x00,0x1C,0x22,0x41,0x00},
-    {0x00,0x41,0x22,0x1C,0x00},
-    {0x2A,0x1C,0x7F,0x1C,0x2A},
-    {0x08,0x08,0x3E,0x08,0x08},
-    {0x00,0x80,0x70,0x30,0x00},
-    {0x08,0x08,0x08,0x08,0x08},
-    {0x00,0x00,0x60,0x60,0x00},
-    {0x20,0x10,0x08,0x04,0x02},
-    {0x3E,0x51,0x49,0x45,0x3E},
-    {0x00,0x42,0x7F,0x40,0x00},
-    {0x72,0x49,0x49,0x49,0x46},
-    {0x21,0x41,0x49,0x4D,0x33},
-    {0x18,0x14,0x12,0x7F,0x10},
-    {0x27,0x45,0x45,0x45,0x39},
-    {0x3C,0x4A,0x49,0x49,0x31},
-    {0x41,0x21,0x11,0x09,0x07},
-    {0x36,0x49,0x49,0x49,0x36},
-    {0x46,0x49,0x49,0x29,0x1E},
-    {0x00,0x00,0x14,0x00,0x00},
-    {0x00,0x40,0x34,0x00,0x00},
-    {0x00,0x08,0x14,0x22,0x41},
-    {0x14,0x14,0x14,0x14,0x14},
-    {0x00,0x41,0x22,0x14,0x08},
-    {0x02,0x01,0x59,0x09,0x06},
-    {0x3E,0x41,0x5D,0x59,0x4E},
-    {0x7C,0x12,0x11,0x12,0x7C},
-    {0x7F,0x49,0x49,0x49,0x36},
-    {0x3E,0x41,0x41,0x41,0x22},
-    {0x7F,0x41,0x41,0x41,0x3E},
-    {0x7F,0x49,0x49,0x49,0x41},
-    {0x7F,0x09,0x09,0x09,0x01},
-    {0x3E,0x41,0x41,0x51,0x73},
-    {0x7F,0x08,0x08,0x08,0x7F},
-    {0x00,0x41,0x7F,0x41,0x00},
-    {0x20,0x40,0x41,0x3F,0x01},
-    {0x7F,0x08,0x14,0x22,0x41},
-    {0x7F,0x40,0x40,0x40,0x40},
-    {0x7F,0x02,0x1C,0x02,0x7F},
-    {0x7F,0x04,0x08,0x10,0x7F},
-    {0x3E,0x41,0x41,0x41,0x3E},
-    {0x7F,0x09,0x09,0x09,0x06},
-    {0x3E,0x41,0x51,0x21,0x5E},
-    {0x7F,0x09,0x19,0x29,0x46},
-    {0x26,0x49,0x49,0x49,0x32},
-    {0x03,0x01,0x7F,0x01,0x03},
-    {0x3F,0x40,0x40,0x40,0x3F},
-    {0x1F,0x20,0x40,0x20,0x1F},
-    {0x3F,0x40,0x38,0x40,0x3F},
-    {0x63,0x14,0x08,0x14,0x63},
-    {0x03,0x04,0x78,0x04,0x03},
-    {0x61,0x59,0x49,0x4D,0x43},
-    {0x00,0x7F,0x41,0x41,0x41},
-    {0x02,0x04,0x08,0x10,0x20},
-    {0x00,0x41,0x41,0x41,0x7F},
-    {0x04,0x02,0x01,0x02,0x04},
-    {0x40,0x40,0x40,0x40,0x40},
-    {0x00,0x03,0x07,0x08,0x00},
-    {0x20,0x54,0x54,0x78,0x40},
-    {0x7F,0x28,0x44,0x44,0x38},
-    {0x38,0x44,0x44,0x44,0x28},
-    {0x38,0x44,0x44,0x28,0x7F},
-    {0x38,0x54,0x54,0x54,0x18},
-    {0x00,0x08,0x7E,0x09,0x02},
-    {0x18,0xA4,0xA4,0x9C,0x78},
-    {0x7F,0x08,0x04,0x04,0x78},
-    {0x00,0x44,0x7D,0x40,0x00},
-    {0x20,0x40,0x40,0x3D,0x00},
-    {0x7F,0x10,0x28,0x44,0x00},
-    {0x00,0x41,0x7F,0x40,0x00},
-    {0x7C,0x04,0x78,0x04,0x78},
-    {0x7C,0x08,0x04,0x04,0x78},
-    {0x38,0x44,0x44,0x44,0x38},
-    {0xFC,0x18,0x24,0x24,0x18},
-    {0x18,0x24,0x24,0x18,0xFC},
-    {0x7C,0x08,0x04,0x04,0x08},
-    {0x48,0x54,0x54,0x54,0x24},
-    {0x04,0x04,0x3F,0x44,0x24},
-    {0x3C,0x40,0x40,0x20,0x7C},
-    {0x1C,0x20,0x40,0x20,0x1C},
-    {0x3C,0x40,0x30,0x40,0x3C},
-    {0x44,0x28,0x10,0x28,0x44},
-    {0x4C,0x90,0x90,0x90,0x7C},
-    {0x44,0x64,0x54,0x4C,0x44},
-    {0x00,0x08,0x36,0x41,0x00},
-    {0x00,0x00,0x77,0x00,0x00},
-    {0x00,0x41,0x36,0x08,0x00},
-    {0x08,0x04,0x08,0x10,0x08}
-};
-
-typedef struct { unsigned int color; short x, y, z; } V2;
-
-static void rect2d(int x0, int y0, int x1, int y1, unsigned int color) {
-    V2 *v = (V2 *)sceGuGetMemory(2 * sizeof(V2));
-    v[0].color = color; v[0].x = x0; v[0].y = y0; v[0].z = 0;
-    v[1].color = color; v[1].x = x1; v[1].y = y1; v[1].z = 0;
-    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
-}
-
-/* texto desenhado pela GPU (fonte 5x7), funciona em qualquer emulador */
-static void ui_text(int x, int y, int sc, unsigned int color, const char *s) {
-    int n = 0;
-    for (const char *p = s; *p; p++) {
-        int c = (unsigned char)*p; if (c < 32 || c > 126) c = 32;
-        for (int col = 0; col < 5; col++) {
-            unsigned char b = font5x7[c - 32][col]; int in = 0;
-            for (int r = 0; r < 8; r++) {
-                int bit = (b >> r) & 1;
-                if (bit && !in) n++;
-                in = bit;
-            }
-        }
-    }
-    if (n == 0) return;
-    V2 *v = (V2 *)sceGuGetMemory(n * 2 * sizeof(V2));
-    int k = 0, cx = x;
-    for (const char *p = s; *p; p++) {
-        int c = (unsigned char)*p; if (c < 32 || c > 126) c = 32;
-        for (int col = 0; col < 5; col++) {
-            unsigned char b = font5x7[c - 32][col]; int start = -1;
-            for (int r = 0; r <= 8; r++) {
-                int bit = (r < 8) ? ((b >> r) & 1) : 0;
-                if (bit && start < 0) start = r;
-                else if (!bit && start >= 0) {
-                    v[k].color = color; v[k].x = cx + col * sc; v[k].y = y + start * sc; v[k].z = 0; k++;
-                    v[k].color = color; v[k].x = cx + (col + 1) * sc; v[k].y = y + r * sc; v[k].z = 0; k++;
-                    start = -1;
+            if (r < 0.62f) {
+                for (i = 0; i < 2; i++)
+                    for (j = 0; j < 2; j++)
+                        if (frand() < 0.88f) {
+                            float w = frange(16, 32), d = frange(16, 32);
+                            float ox = x0 + i * 40.0f + frange(2, 38 - w), oz = z0 + j * 40.0f + frange(2, 38 - d);
+                            add_bld(ox, oz, ox + w, oz + d, frange(6, 22), pal[rnd_u() % 6], 0);
+                        }
+                for (k = 0; k < 4; k++) add_tree(x0 + frange(0, 80), z0 + frange(0, 80));
+            } else if (r < 0.78f) { /* parque */
+                for (k = 0; k < 18; k++) add_tree(x0 + frange(2, 78), z0 + frange(2, 78));
+            } else if (r < 0.92f) { /* acampamento de sobreviventes */
+                float cx = x0 + 40.0f, cz = z0 + 40.0f;
+                if (ncamps < MAX_CAMPS) { camps[ncamps][0] = cx; camps[ncamps][1] = cz; ncamps++; }
+                for (k = 0; k < 7; k++) {
+                    float a = k * (2.0f * PI / 7.0f), px = cx + cosf(a) * 7.0f, pz = cz + sinf(a) * 7.0f;
+                    add_bld(px - 1.1f, pz - 1.1f, px + 1.1f, pz + 1.1f, frange(1.0f, 1.8f), RGB(105 + k * 4, 78, 48), 1);
+                }
+                for (k = 0; k < 6; k++) add_tree(x0 + frange(0, 80), z0 + frange(0, 80));
+            } else {
+                for (k = 0; k < 9; k++) add_tree(x0 + frange(2, 78), z0 + frange(2, 78));
+                for (k = 0; k < 4; k++) {
+                    float px = x0 + frange(5, 75), pz = z0 + frange(5, 75);
+                    add_bld(px, pz, px + 2.2f, pz + 2.2f, 1.4f, RGB(90, 90, 96), 1);
                 }
             }
         }
-        cx += 6 * sc;
+}
+
+static int inside_bld(float x, float z, float m)
+{
+    int i;
+    for (i = 0; i < nbld; i++)
+        if (x > blds[i].x0 - m && x < blds[i].x1 + m && z > blds[i].z0 - m && z < blds[i].z1 + m) return 1;
+    return 0;
+}
+
+static int collide_bld(float *x, float *z, float r)
+{
+    int i, hit = 0;
+    for (i = 0; i < nbld; i++) {
+        const Bld *b = &blds[i];
+        float cx, cz, dx, dz, d2;
+        if (*x < b->x0 - r || *x > b->x1 + r || *z < b->z0 - r || *z > b->z1 + r) continue;
+        cx = clampf(*x, b->x0, b->x1); cz = clampf(*z, b->z0, b->z1);
+        dx = *x - cx; dz = *z - cz; d2 = dx * dx + dz * dz;
+        if (d2 < r * r) {
+            if (d2 > 1e-6f) {
+                float d = sqrtf(d2);
+                *x = cx + dx / d * r; *z = cz + dz / d * r;
+            } else {
+                float l = *x - b->x0, rr = b->x1 - *x, t = *z - b->z0, bt = b->z1 - *z;
+                float m = fminf(fminf(l, rr), fminf(t, bt));
+                if (m == l) *x = b->x0 - r; else if (m == rr) *x = b->x1 + r;
+                else if (m == t) *z = b->z0 - r; else *z = b->z1 + r;
+            }
+            hit = 1;
+        }
     }
-    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D, k, 0, v);
+    return hit;
 }
 
-static void ui_shadow(int x, int y, int sc, unsigned int color, const char *s) {
-    ui_text(x, y, sc, color, s);
+static int collide_trees(float *x, float *z, float r)
+{
+    int i, hit = 0;
+    for (i = 0; i < ntree; i++) {
+        float dx = *x - trees[i].x, dz = *z - trees[i].z, rr = r + 0.35f, d2 = dx * dx + dz * dz;
+        if (d2 < rr * rr) {
+            float d = sqrtf(d2);
+            if (d < 1e-4f) { dx = 1; dz = 0; d = 1; }
+            *x = trees[i].x + dx / d * rr; *z = trees[i].z + dz / d * rr;
+            hit = 1;
+        }
+    }
+    return hit;
 }
 
-/* ---------- personagens e armas em 3D ---------- */
-typedef struct { float ox, oy, oz, sx, sy, sz; unsigned int col; } WPart;
-static const WPart WPARTS[NW][4] = {
-    { { 0, 0, 0, 0, 0, 0, 0 } },
-    { { 0, -0.04f, 0.5f, 0.09f, 0.09f, 1.0f, 0xff3a6a9a }, { 0, -0.07f, 0.95f, 0.14f, 0.14f, 0.3f, 0xff3a6a9a } },
-    { { 0, -0.035f, 0.5f, 0.07f, 0.07f, 1.0f, 0xff3a6a9a }, { 0, -0.17f, 0.92f, 0.05f, 0.34f, 0.24f, 0xffa0a8a8 } },
-    { { 0, -0.06f, 0.55f, 0.03f, 0.12f, 0.9f, 0xffd0d8d8 }, { 0, -0.04f, 0.05f, 0.05f, 0.08f, 0.22f, 0xff202830 } },
-    { { 0, -0.05f, 0.25f, 0.10f, 0.14f, 0.45f, 0xff484848 }, { 0, -0.2f, 0.08f, 0.09f, 0.2f, 0.12f, 0xff202020 } },
-    { { 0, -0.07f, 0.3f, 0.12f, 0.16f, 0.7f, 0xff404040 }, { 0, -0.3f, 0.25f, 0.08f, 0.24f, 0.1f, 0xff202020 },
-      { 0, -0.05f, -0.2f, 0.08f, 0.1f, 0.3f, 0xff303030 } },
-    { { 0, -0.04f, 0.6f, 0.09f, 0.09f, 1.2f, 0xff606870 }, { 0, -0.12f, -0.2f, 0.11f, 0.18f, 0.55f, 0xff3a6a9a },
-      { 0, -0.1f, 0.55f, 0.13f, 0.12f, 0.3f, 0xff2a4a6a } },
-    { { 0, -0.03f, 0.7f, 0.07f, 0.07f, 1.3f, 0xff505860 }, { 0, -0.09f, 0.05f, 0.11f, 0.16f, 0.65f, 0xff2a4a6a },
-      { 0, 0.06f, 0.35f, 0.06f, 0.06f, 0.3f, 0xff101010 }, { 0, -0.1f, -0.35f, 0.1f, 0.2f, 0.4f, 0xff2a4a6a } }
-};
-static const int WPN[NW] = { 0, 2, 2, 2, 2, 3, 3, 4 };
-
-/* arma presa na mao: pivo no ombro, gira com o braco; com pitch=-90 graus o eixo z da arma aponta para frente */
-static void weapon_part(float x, float y, float z, float yaw, float pitch, float armLen, const WPart *p) {
-    ScePspFVector3 t1 = { x, y, z }, t2 = { 0, -armLen, 0 }, t3 = { p->ox, p->oy, p->oz }, s = { p->sx, p->sy, p->sz };
-    sceGumMatrixMode(GU_MODEL);
-    sceGumLoadIdentity();
-    sceGumTranslate(&t1); sceGumRotateY(yaw); sceGumRotateX(pitch); sceGumTranslate(&t2);
-    sceGumRotateX(1.5708f); sceGumTranslate(&t3); sceGumScale(&s);
-    sceGumUpdateMatrix();
-    sceGuColor(p->col);
-    sceGumDrawArray(GU_TRIANGLES, VTX_TYPE, 36, 0, cube);
-}
-static void draw_weapon(int w, float x, float y, float z, float yaw, float pitch, float armLen) {
-    for (int k = 0; k < WPN[w]; k++) weapon_part(x, y, z, yaw, pitch, armLen, &WPARTS[w][k]);
+static float ray_bld(float px, float py, float pz, float dx, float dy, float dz, float maxt)
+{
+    float best = maxt;
+    int i;
+    for (i = 0; i < nbld; i++) {
+        const Bld *b = &blds[i];
+        float tmin = 0.0f, tmax = best, y;
+        if (fabsf(dx) < 1e-6f) { if (px < b->x0 || px > b->x1) continue; }
+        else {
+            float t1 = (b->x0 - px) / dx, t2 = (b->x1 - px) / dx;
+            if (t1 > t2) { float t = t1; t1 = t2; t2 = t; }
+            if (t1 > tmin) tmin = t1;
+            if (t2 < tmax) tmax = t2;
+            if (tmin > tmax) continue;
+        }
+        if (fabsf(dz) < 1e-6f) { if (pz < b->z0 || pz > b->z1) continue; }
+        else {
+            float t1 = (b->z0 - pz) / dz, t2 = (b->z1 - pz) / dz;
+            if (t1 > t2) { float t = t1; t1 = t2; t2 = t; }
+            if (t1 > tmin) tmin = t1;
+            if (t2 < tmax) tmax = t2;
+            if (tmin > tmax) continue;
+        }
+        y = py + dy * tmin;
+        if (y > b->h || y < 0.0f) continue;
+        best = tmin;
+    }
+    return best;
 }
 
-/* parte do corpo: origem no chao, gira com o personagem; hang=1 faz o bloco pender do pivo (bracos e pernas) */
-static void body_part(float x, float z, float yaw, float ox, float oy, float oz, float pitch, int hang,
-                      float sx, float sy, float sz, unsigned int col) {
-    ScePspFVector3 t1 = { x, 0, z }, t2 = { ox, oy, oz }, t3 = { 0, -sy, 0 }, s = { sx, sy, sz };
-    sceGumMatrixMode(GU_MODEL);
-    sceGumLoadIdentity();
-    sceGumTranslate(&t1); sceGumRotateY(yaw); sceGumTranslate(&t2);
-    if (pitch != 0.0f) sceGumRotateX(pitch);
-    if (hang) sceGumTranslate(&t3);
-    sceGumScale(&s);
-    sceGumUpdateMatrix();
-    sceGuColor(col);
-    sceGumDrawArray(GU_TRIANGLES, VTX_TYPE, 36, 0, cube);
+/*------------------------------ entidades ---------------------------*/
+typedef struct { float x, z, yaw, hp, anim, atk, hurt, deadt, wander; int type, alive; } Zombie;
+typedef struct { float x, z, yaw, speed, hp; int type, state; } Car; /* state 0 parado, 1 dirigindo, 2 destruido */
+typedef struct { float x, z, yaw, hp, anim, cool, flash; int state, name, inside; unsigned int shirt; } Survivor; /* 0 acampamento, 1 seguindo, 2 morto */
+
+typedef struct {
+    float x, z, yaw, pitch, hp, stamina, fire_cd, reload_t, flash, recoil, bob, hitmark, dmg_flash, bloom, fov, aim, stam_delay, speed;
+    int weapon, mag[3], reserve[3], medkits, in_car, reloading, kills;
+} Player;
+
+static Player P;
+static Zombie Z[MAX_ZOMBIES];
+static Car C[MAX_CARS];
+static Survivor S[MAX_SURV];
+static int nsurv = 0;
+static struct {
+    int wave, kills, recruited, prompt_kind, prompt_idx, aim_hit;
+    float wave_t, spawn_t, time, msg_t;
+    char msg[64];
+} G;
+
+static const char *SURV_NAMES[16] = {"Joao", "Maria", "Carlos", "Ana", "Pedro", "Luiza", "Rafael", "Bia",
+                                     "Marcos", "Julia", "Tiago", "Lia", "Diego", "Nina", "Caio", "Vera"};
+
+static void say(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(G.msg, sizeof(G.msg), fmt, ap);
+    va_end(ap);
+    G.msg_t = 3.0f;
 }
 
-typedef struct { unsigned int skin, shirt, pants, hair, eye; } HPal;
-static const HPal HPAL_PLAYER = { 0xff90b8f0, 0xff405830, 0xff604838, 0xff2040a0, 0xff202020 };
-static const HPal HPAL_Z[3] = {
-    { 0xff60b080, 0xff506890, 0xff404858, 0xff203030, 0xff2020e0 },
-    { 0xff70c090, 0xff3030a0, 0xff303038, 0xff202040, 0xff30d0ff },
-    { 0xff508060, 0xff403060, 0xff303038, 0xff182018, 0xff2020e0 }
-};
-static const HPal HPAL_HIT = { 0xffd0d0ff, 0xffc0c0ff, 0xffb0b0ff, 0xffd0d0ff, 0xff20e0ff };
-static const float Z_K[3] = { 1.0f, 0.95f, 1.45f };
+static int count_follow(void)
+{
+    int i, n = 0;
+    for (i = 0; i < nsurv; i++) if (S[i].state == 1) n++;
+    return n;
+}
 
-static void draw_humanoid(float x, float z, float yaw, float k, const HPal *p, float legSw, float armL, float armR,
-                          int weapon, int lod, int player) {
-    float c = cosf(yaw), s = sinf(yaw);
-    if (lod) {
-        body_part(x, z, yaw, 0, 0.0f, 0, 0, 0, 0.55f * k, 1.55f * k, 0.32f * k, p->shirt);
-        body_part(x, z, yaw, 0, 1.5f * k, 0, 0, 0, 0.42f * k, 0.42f * k, 0.42f * k, p->skin);
+static void spawn_zombie(float x, float z, int type)
+{
+    int i;
+    for (i = 0; i < MAX_ZOMBIES; i++)
+        if (!Z[i].alive) {
+            Zombie *q = &Z[i];
+            float base = type == 0 ? 100.0f : (type == 1 ? 60.0f : 400.0f);
+            memset(q, 0, sizeof(*q));
+            q->alive = 1; q->type = type; q->x = x; q->z = z; q->yaw = frand() * 2 * PI;
+            q->hp = base * (1.0f + 0.08f * (float)(G.wave - 1));
+            q->wander = frange(1, 4); q->anim = frand() * 6.0f;
+            return;
+        }
+}
+
+static void spawn_near(float cx, float cz, float rmin, float rmax, int type)
+{
+    int t;
+    for (t = 0; t < 10; t++) {
+        float a = frand() * 2 * PI, r = frange(rmin, rmax);
+        float x = cx + cosf(a) * r, z = cz + sinf(a) * r;
+        if (fabsf(x) > WORLD_HALF + 10 || fabsf(z) > WORLD_HALF + 10) continue;
+        if (inside_bld(x, z, 1.5f)) continue;
+        spawn_zombie(x, z, type);
         return;
     }
-    body_part(x, z, yaw, -0.16f * k, 0.85f * k, 0, legSw, 1, 0.24f * k, 0.85f * k, 0.26f * k, p->pants);
-    body_part(x, z, yaw,  0.16f * k, 0.85f * k, 0, -legSw, 1, 0.24f * k, 0.85f * k, 0.26f * k, p->pants);
-    body_part(x, z, yaw, 0, 0.85f * k, 0, 0, 0, 0.62f * k, 0.7f * k, 0.34f * k, p->shirt);
-    body_part(x, z, yaw, 0, 1.55f * k, 0, 0, 0, 0.42f * k, 0.4f * k, 0.4f * k, p->skin);
-    body_part(x, z, yaw, 0, 1.93f * k, 0, 0, 0, 0.46f * k, 0.12f * k, 0.46f * k, p->hair);
-    body_part(x, z, yaw, -0.1f * k, 1.72f * k, 0.2f * k, 0, 0, 0.07f * k, 0.07f * k, 0.05f * k, p->eye);
-    body_part(x, z, yaw,  0.1f * k, 1.72f * k, 0.2f * k, 0, 0, 0.07f * k, 0.07f * k, 0.05f * k, p->eye);
-    if (player) {
-        body_part(x, z, yaw, 0, 1.86f * k, 0.25f * k, 0, 0, 0.32f * k, 0.05f * k, 0.18f * k, p->hair);
-        body_part(x, z, yaw, 0, 0.95f * k, -0.26f * k, 0, 0, 0.44f * k, 0.52f * k, 0.2f * k, 0xff304048);
-    }
-    body_part(x, z, yaw, -0.40f * k, 1.5f * k, 0, armR, 1, 0.18f * k, 0.7f * k, 0.18f * k, p->shirt);
-    body_part(x, z, yaw,  0.40f * k, 1.5f * k, 0, armL, 1, 0.18f * k, 0.7f * k, 0.18f * k, p->shirt);
-    if (weapon > 0) draw_weapon(weapon, x - 0.40f * k * c, 1.5f * k, z + 0.40f * k * s, yaw, armR, 0.7f * k);
 }
 
-static void draw_corpse(float x, float z, float yaw, float k, const HPal *p) {
-    body_part(x, z, yaw, 0, 0.2f * k, 0, -1.5708f, 0, 0.6f * k, 1.55f * k, 0.34f * k, p->shirt);
-    body_part(x, z, yaw, 0, 0.05f * k, -1.75f * k, 0, 0, 0.42f * k, 0.42f * k, 0.42f * k, p->skin);
+static int pick_ztype(void)
+{
+    float r = frand();
+    if (G.wave >= 3 && r < 0.07f + 0.01f * G.wave) return 2;
+    if (G.wave >= 2 && r < 0.30f) return 1;
+    return 0;
 }
 
-/* ---------- cena ---------- */
-static void fence_line(float x1, float z1, float x2, float z2) {
-    float dx = x2 - x1, dz = z2 - z1, len = sqrtf(dx * dx + dz * dz);
-    float mx = (x1 + x2) * 0.5f, mz = (z1 + z2) * 0.5f;
-    if (dist2d(px, pz, mx, mz) > len * 0.5f + 45.0f) return;
-    float ang = atan2f(dx, dz); int n = (int)(len / 6.0f); if (n < 1) n = 1;
-    box(mx, 0.5f, mz, 0.12f, 0.12f, len, ang, 0xff505860);
-    box(mx, 1.1f, mz, 0.12f, 0.12f, len, ang, 0xff505860);
-    for (int i = 0; i <= n; i++) box(x1 + dx * i / n, 0, z1 + dz * i / n, 0.25f, 1.5f, 0.25f, 0, 0xff303840);
-}
-
-static void draw_car(float x, float z, float ang, int idx) {
-    static const unsigned int cc[4] = { 0xff3040a0, 0xff707878, 0xff305870, 0xff404040 };
-    float c = cosf(ang), s = sinf(ang);
-    box(x, 0.35f, z, 2.2f, 0.9f, 4.2f, ang, cc[idx % 4]);
-    box(x - s * 0.2f, 1.25f, z - c * 0.2f, 1.9f, 0.8f, 2.2f, ang, 0xff202830);
-    for (int a = -1; a <= 1; a += 2) for (int b = -1; b <= 1; b += 2) {
-        float lx = a * 1.1f, lz = b * 1.3f;
-        box(x + lx * c + lz * s, 0, z - lx * s + lz * c, 0.3f, 0.6f, 0.6f, ang, 0xff101010);
+static void world_gen_entities(void)
+{
+    int i, n;
+    rng_state = (unsigned)sceKernelGetSystemTimeLow() | 1u;
+    memset(Z, 0, sizeof(Z)); memset(C, 0, sizeof(C)); memset(S, 0, sizeof(S));
+    /* carro do jogador (escolhido na loja) */
+    C[0].x = 58.0f; C[0].z = 50.0f; C[0].yaw = -PI / 2; C[0].type = sv.selcar; C[0].hp = (float)CARS[sv.selcar].hp;
+    n = 1;
+    /* carros espalhados pelas ruas */
+    while (n < 32) {
+        int horiz = rnd_u() & 1, k = (int)(rnd_u() % 9) - 4;
+        float line = k * 100.0f, along = frange(-380, 380), lane = (rnd_u() & 1) ? 3.2f : -3.2f;
+        float x = horiz ? along : line + lane, z = horiz ? line + lane : along;
+        if (dist2(x, z, 50, 50) < 900.0f) continue;
+        C[n].x = x; C[n].z = z; C[n].type = (int)(rnd_u() % CAR_COUNT); C[n].hp = (float)CARS[C[n].type].hp;
+        C[n].yaw = (horiz ? PI / 2 : 0.0f) + ((rnd_u() & 1) ? PI : 0.0f) + frange(-0.08f, 0.08f);
+        n++;
     }
-}
-
-static void draw_building(const Bld *b) {
-    float dz = b->z + b->door * (b->hd + 0.05f);
-    box(b->x, 0, b->z, b->hw * 2, b->h, b->hd * 2, 0, b->wall);
-    box(b->x, b->h, b->z, b->hw * 2 + 0.5f, 0.6f, b->hd * 2 + 0.5f, 0, b->roof);
-    if (b->h > 10.0f) return;
-    box(b->x, 0, dz, 1.2f, 2.2f, 0.12f, 0, 0xff203040);
-    box(b->x - b->hw * 0.55f, 1.6f, dz, 0.9f, 0.9f, 0.1f, 0, 0xff101418);
-    box(b->x + b->hw * 0.55f, 1.6f, dz, 0.9f, 0.9f, 0.1f, 0, 0xff101418);
-}
-
-static void draw_world_pois(void) {
-    /* roads */
-    for (int i = 0; i < NROADS; i++) {
-        float x1 = ROADS[i][0], z1 = ROADS[i][1], x2 = ROADS[i][2], z2 = ROADS[i][3];
-        float mx = (x1 + x2) * 0.5f, mz = (z1 + z2) * 0.5f;
-        float lx = fabsf(x2 - x1), lz = fabsf(z2 - z1);
-        if (dist2d(px, pz, mx, mz) > (lx > lz ? lx : lz) * 0.5f + 45.0f) continue;
-        if (lx > lz) box(mx, 0.04f, mz, lx, 0.08f, 5.0f, 0, 0xff484c50);
-        else box(mx, 0.04f, mz, 5.0f, 0.08f, lz, 0, 0xff484c50);
+    /* sobreviventes nos acampamentos */
+    nsurv = 0;
+    for (i = 0; i < ncamps && nsurv < MAX_SURV; i++) {
+        int cnt = (i == 0) ? 1 : 1 + (int)(rnd_u() & 1), j;
+        for (j = 0; j < cnt && nsurv < MAX_SURV; j++) {
+            Survivor *s = &S[nsurv];
+            s->x = camps[i][0] + frange(-3, 3); s->z = camps[i][1] + frange(-3, 3);
+            s->yaw = frand() * 2 * PI; s->hp = 60; s->state = 0; s->name = (int)(rnd_u() % 16);
+            s->shirt = RGB(40 + (rnd_u() % 80), 70 + (rnd_u() % 90), 110 + (rnd_u() % 120));
+            nsurv++;
+        }
     }
-    /* lago */
-    if (NEAR(LAKE_X, LAKE_Z, 70)) box(LAKE_X, 0.02f, LAKE_Z, LAKE_HX * 2, 0.1f, LAKE_HZ * 2, 0, 0xffa06030);
-    /* cidade, posto, fazenda, torre, base militar */
-    for (int i = 0; i < NB; i++) if (NEAR(BLD[i].x, BLD[i].z, 75)) draw_building(&BLD[i]);
-    for (int i = 0; i < NCARS; i++) if (NEAR(CARS[i][0], CARS[i][1], 60)) draw_car(CARS[i][0], CARS[i][1], CARS[i][2], i);
-    if (NEAR(-35, -52, 70)) {
-        box(-33, 3.2f, -50, 6.0f, 0.4f, 4.0f, 0, 0xff2020b0);
-        box(-35.5f, 0, -48.5f, 0.3f, 3.2f, 0.3f, 0, 0xffc0c0c0); box(-30.5f, 0, -48.5f, 0.3f, 3.2f, 0.3f, 0, 0xffc0c0c0);
-        box(-34, 0, -50, 0.7f, 1.4f, 0.7f, 0, 0xff2020d0); box(-32, 0, -50, 0.7f, 1.4f, 0.7f, 0, 0xff2020d0);
-    }
-    if (NEAR(66, 24, 70)) { box(66, 0, 24, 2.5f, 7.0f, 2.5f, 0, 0xffa0a8a8); box(66, 7.0f, 24, 2.8f, 0.8f, 2.8f, 0, 0xff303030); }
-    if (NEAR(-65, -15, 80)) {
-        box(-65, 16.0f, -15, 4.5f, 0.6f, 4.5f, 0, 0xff404850);
-        box(-65, 16.6f, -15, 0.2f, 6.0f, 0.2f, 0, 0xffc0c0c0);
-        box(-65, 22.4f, -15, 0.6f, 0.6f, 0.6f, 0, (((int)(gameTime * 2.0f)) & 1) ? 0xff2020ff : 0xff202060);
-    }
-    if (NEAR(68, 53, 80)) {
-        fence_line(54, 39, 82, 39); fence_line(82, 39, 82, 67); fence_line(82, 67, 54, 67); fence_line(54, 67, 54, 39);
-        box(66, 0, 60, 4.0f, 2.2f, 3.0f, 0, 0xff486038); box(72, 0, 46, 4.0f, 2.2f, 3.0f, 0, 0xff486038);
-        for (int a = -1; a <= 1; a += 2) for (int b = -1; b <= 1; b += 2) box(80 + a * 0.9f, 0, 42 + b * 0.9f, 0.25f, 6.0f, 0.25f, 0, 0xff505858);
-        box(80, 6.0f, 42, 2.8f, 0.4f, 2.8f, 0, 0xff303838);
-        box(76, 0.05f, 46, 6.0f, 0.1f, 6.0f, 0, 0xff303030); box(76, 0.12f, 46, 0.5f, 0.05f, 3.0f, 0, 0xffe0e0e0);
-        box(76, 0.12f, 46, 2.0f, 0.05f, 0.5f, 0, 0xffe0e0e0);
+    /* zumbis iniciais */
+    G.wave = 1;
+    for (i = 0; i < 12; i++) {
+        float x = frange(-380, 380), z = frange(-380, 380);
+        if (dist2(x, z, 50, 50) < 3600.0f || inside_bld(x, z, 1.5f)) { i--; continue; }
+        spawn_zombie(x, z, 0);
     }
 }
 
-static void draw_base(void) {
-    float fl = 0.5f + 0.5f * sinf(gameTime * 12.0f);
-    box(BASE_X, 0.05f, BASE_Z, 1.4f, 0.3f, 0.3f, 0.6f, 0xff203050); box(BASE_X, 0.05f, BASE_Z, 1.4f, 0.3f, 0.3f, -0.6f, 0xff203050);
-    box(BASE_X, 0.2f, BASE_Z, 0.7f, 0.5f + fl * 0.5f, 0.7f, 0, 0xff2080ff);
-    box(BASE_X, 0.5f, BASE_Z, 0.4f, 0.4f + fl * 0.4f, 0.4f, 0, 0xff30e0ff);
-    box(-5, 0, -4, 3.6f, 1.8f, 3.0f, 0, 0xff486038); box(-5, 1.8f, -4, 3.6f, 0.4f, 1.0f, 0, 0xff384828);
-    box(5, 0, -4, 1.8f, 1.0f, 1.0f, 0, 0xff3a6a9a); box(5, 1.0f, -4, 0.8f, 0.5f, 0.6f, 0, 0xff303030);
-    box(5.6f, 1.0f, -4, 0.1f, 2.4f, 0.1f, 0, 0xffc0c0c0);
-    box(HELI_X, 0.05f, HELI_Z, 7.0f, 0.1f, 7.0f, 0, 0xff404040);
-    box(HELI_X, 0.12f, HELI_Z, 0.5f, 0.05f, 3.0f, 0, 0xffe0e0e0); box(HELI_X, 0.12f, HELI_Z, 2.0f, 0.05f, 0.5f, 0, 0xffe0e0e0);
-    if (rescue == 0) for (int i = 0; i < 16; i++) {
-        float a = i * (PI_F / 8.0f);
-        box(BASE_X + cosf(a) * SAFE_R, 0, BASE_Z + sinf(a) * SAFE_R, 0.4f, 0.5f, 0.4f, 0, 0xffa0e0a0);
+/*------------------------------ rede (multiplayer) ------------------*/
+/* Camada preparada: pacotes binarios, fila com latencia simulada e
+   jogadores remotos. Para ligar o Ad-Hoc real (pspnet_adhoc), basta
+   implementar net_transport_send/net_transport_recv. O estado local e
+   a entrada ja estao separados da simulacao. O host deve ser a
+   autoridade dos zumbis (enviar snapshot de zumbis em NET_PKT_WORLD). */
+#define NET_MAX 4
+#define NET_MAGIC 0x5347u
+#define NET_VERSION 1
+#define NET_PKT_STATE 1
+#define NET_PKT_WORLD 2
+
+typedef struct __attribute__((packed)) {
+    unsigned short magic; unsigned char ver, type, id, weapon, flags, car_type;
+    float x, z, yaw, pitch; short hp; unsigned int seq;
+} NetPacket;
+
+typedef struct { int active; float x, z, yaw, pitch, anim; int hp, weapon, in_car, car_type; } RemotePlayer;
+static RemotePlayer RP[NET_MAX];
+static struct { int mode; unsigned int seq; float send_t; NetPacket q[16]; float qt[16]; int qn; } net;
+
+static void net_pack(NetPacket *p)
+{
+    p->magic = NET_MAGIC; p->ver = NET_VERSION; p->type = NET_PKT_STATE; p->id = 0;
+    p->weapon = (unsigned char)P.weapon; p->flags = (unsigned char)(P.in_car >= 0);
+    p->car_type = (unsigned char)(P.in_car >= 0 ? C[P.in_car].type : 0);
+    p->x = P.x; p->z = P.z; p->yaw = P.yaw; p->pitch = P.pitch; p->hp = (short)P.hp; p->seq = net.seq++;
+}
+
+static void net_apply(const NetPacket *p, float ox, float oz)
+{
+    RemotePlayer *r;
+    if (p->magic != NET_MAGIC || p->ver != NET_VERSION || p->type != NET_PKT_STATE || p->id >= NET_MAX) return;
+    r = &RP[p->id];
+    r->active = 1;
+    r->anim += sqrtf(dist2(r->x, r->z, p->x + ox, p->z + oz)) * 1.4f;
+    r->x = p->x + ox; r->z = p->z + oz; r->yaw = p->yaw; r->pitch = p->pitch;
+    r->hp = p->hp; r->weapon = p->weapon; r->in_car = p->flags & 1; r->car_type = p->car_type;
+}
+
+static void net_tick(float dt)
+{
+    int i;
+    if (net.mode == 0) return;
+    net.send_t += dt;
+    if (net.send_t >= 0.05f) { /* 20 pacotes/s */
+        net.send_t = 0;
+        if (net.mode == 1 && net.qn < 16) { /* loopback: entrega local com 100 ms de atraso */
+            net_pack(&net.q[net.qn]);
+            net.q[net.qn].id = 1;
+            net.qt[net.qn] = 0.10f;
+            net.qn++;
+        }
+        /* net.mode == 2: net_transport_send(&pacote, sizeof(pacote)); */
     }
-    if (rescue == 2) {
-        float t = 90.0f - rescueT, y = (t < 5.0f) ? (1.0f - t / 5.0f) * 22.0f : 0.0f;
-        box(HELI_X, 0.4f + y, HELI_Z, 2.2f, 1.8f, 5.0f, 0, 0xff405030);
-        box(HELI_X, 1.1f + y, HELI_Z - 4.5f, 0.6f, 0.6f, 4.0f, 0, 0xff405030);
-        box(HELI_X - 1.3f, 0.2f + y, HELI_Z, 0.15f, 0.15f, 4.5f, 0, 0xff202020); box(HELI_X + 1.3f, 0.2f + y, HELI_Z, 0.15f, 0.15f, 4.5f, 0, 0xff202020);
-        box(HELI_X, 2.2f + y, HELI_Z, 9.0f, 0.08f, 0.5f, gameTime * 25.0f, 0xff202020);
-        box(HELI_X, 2.2f + y, HELI_Z, 9.0f, 0.08f, 0.5f, gameTime * 25.0f + 1.57f, 0xff202020);
+    for (i = 0; i < net.qn; i++) net.qt[i] -= dt;
+    while (net.qn > 0 && net.qt[0] <= 0) {
+        net_apply(&net.q[0], 4.0f, 3.0f);
+        memmove(&net.q[0], &net.q[1], (size_t)(net.qn - 1) * sizeof(NetPacket));
+        memmove(&net.qt[0], &net.qt[1], (size_t)(net.qn - 1) * sizeof(float));
+        net.qn--;
     }
 }
 
-static void draw_scene(void) {
-    float dl = daylight(), nt = nightness();
-    float b = 0.2f + 0.8f * dl;
-    float skyR = 110.0f * (1 - nt) + 12.0f * nt, skyG = 190.0f * (1 - nt) + 18.0f * nt, skyB = 235.0f * (1 - nt) + 40.0f * nt;
-    unsigned int sky = 0xff000000 | ((unsigned int)skyB << 16) | ((unsigned int)skyG << 8) | (unsigned int)skyR;
-    sceGuClearColor(sky);
-    sceGuClearDepth(0);
-    sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT | GU_FAST_CLEAR_BIT);
+/*------------------------------ jogo: logica ------------------------*/
+static void zombie_kill_reward(const Zombie *z)
+{
+    int add = z->type == 0 ? 20 : (z->type == 1 ? 30 : 100);
+    sv.money += add + G.wave * 2;
+    G.kills++;
+    P.kills++;
+}
 
+static void zombie_damage(Zombie *z, float dmg, int by_player)
+{
+    if (!z->alive || z->hp <= 0) return;
+    z->hp -= dmg; z->hurt = 0.15f;
+    if (z->hp <= 0) { z->deadt = 0.01f; if (by_player) zombie_kill_reward(z); }
+}
+
+static float ray_zombie(const Zombie *z, float px, float py, float pz, float dx, float dy, float dz, float maxt)
+{
+    float ox = px - z->x, oz = pz - z->z, r = z->type == 2 ? 0.8f : 0.55f, h = z->type == 2 ? 2.3f : 1.85f;
+    float a = dx * dx + dz * dz, b, c, disc, t, y;
+    if (!z->alive || z->hp <= 0 || a < 1e-6f) return -1.0f;
+    b = ox * dx + oz * dz; c = ox * ox + oz * oz - r * r;
+    disc = b * b - a * c;
+    if (disc < 0) return -1.0f;
+    t = (-b - sqrtf(disc)) / a;
+    if (t < 0) t = 0;
+    if (t > maxt) return -1.0f;
+    y = py + dy * t;
+    if (y < 0 || y > h) return -1.0f;
+    return t;
+}
+
+static void fire_dir(float yaw, float pitch, float rx, float ry, float *dx, float *dy, float *dz)
+{
+    float cs = cosf(yaw), sn = sinf(yaw), cp = cosf(pitch), sp = sinf(pitch);
+    float fx = -sn * cp, fy = sp, fz = -cs * cp;
+    float rxx = cs, rzz = -sn;
+    float ux = sn * sp, uy = cp, uz = cs * sp;
+    float x = fx + rxx * rx + ux * ry, y = fy + uy * ry, z = fz + rzz * rx + uz * ry;
+    float l = sqrtf(x * x + y * y + z * z);
+    *dx = x / l; *dy = y / l; *dz = z / l;
+}
+
+static void player_shoot(void)
+{
+    const WeaponDef *w = &WEAP[P.weapon];
+    int p, i;
+    float eye = 1.65f, moving = P.speed > 0.5f ? 1.0f : 0.0f;
+    float sp = w->spread * (1.0f + P.bloom * 2.0f + moving * 0.8f) * (P.aim > 0.5f ? 0.45f : 1.0f);
+    for (p = 0; p < w->pellets; p++) {
+        float dx, dy, dz, tb, best = w->range;
+        int bi = -1;
+        fire_dir(P.yaw, P.pitch + P.recoil, frange(-sp, sp), frange(-sp, sp), &dx, &dy, &dz);
+        tb = ray_bld(P.x, eye, P.z, dx, dy, dz, w->range);
+        best = tb;
+        for (i = 0; i < MAX_ZOMBIES; i++) {
+            float t = ray_zombie(&Z[i], P.x, eye, P.z, dx, dy, dz, best);
+            if (t >= 0 && t < best) { best = t; bi = i; }
+        }
+        if (bi >= 0) {
+            float fall = clampf(1.0f - best / w->range, 0.35f, 1.0f);
+            zombie_damage(&Z[bi], w->dmg * fall, 1);
+            Z[bi].x += dx * 0.25f; Z[bi].z += dz * 0.25f;
+            P.hitmark = 0.18f;
+        }
+    }
+    P.mag[P.weapon]--;
+    P.fire_cd = w->rate;
+    P.flash = 0.07f;
+    P.recoil += w->recoil;
+    P.bloom = clampf(P.bloom + (w->automatic ? 0.12f : 0.3f), 0, 1);
+}
+
+static void player_hurt(float d)
+{
+    if (P.in_car >= 0) { C[P.in_car].hp -= d * 1.5f; P.dmg_flash = 0.15f; return; }
+    P.hp -= d; P.dmg_flash = 0.45f;
+}
+
+static void exit_car(int hurt)
+{
+    Car *c;
+    int i, k = 0;
+    float rx, rz;
+    if (P.in_car < 0) return;
+    c = &C[P.in_car];
+    rx = cosf(c->yaw); rz = -sinf(c->yaw);
+    P.x = c->x + rx * 2.4f; P.z = c->z + rz * 2.4f;
+    collide_bld(&P.x, &P.z, 0.5f);
+    if (c->state == 1) c->state = 0;
+    c->speed = 0;
+    P.in_car = -1;
+    if (hurt) P.hp -= 15;
+    for (i = 0; i < nsurv; i++)
+        if (S[i].state == 1 && S[i].inside) {
+            float a = k++ * 1.3f;
+            S[i].inside = 0; S[i].x = P.x + cosf(a) * 2.0f; S[i].z = P.z + sinf(a) * 2.0f;
+        }
+}
+
+static void car_update_driven(Car *c, const Input *in, float dt)
+{
+    const CarDef *d = &CARS[c->type];
+    float thr = in->my, sf, fx, fz, ox, oz;
+    int i;
+    if (thr > 0.05f) c->speed += d->acc * thr * dt * (c->speed < -0.5f ? 2.5f : 1.0f);
+    else if (thr < -0.05f) c->speed += d->acc * thr * dt * (c->speed > 0.5f ? 2.5f : 0.6f);
+    else {
+        float drag = 3.0f * dt;
+        if (c->speed > 0) c->speed = fmaxf(0.0f, c->speed - drag); else c->speed = fminf(0.0f, c->speed + drag);
+    }
+    if (in->b & PSP_CTRL_SQUARE) {
+        float br = 20.0f * dt;
+        if (c->speed > 0) c->speed = fmaxf(0.0f, c->speed - br); else c->speed = fminf(0.0f, c->speed + br);
+    }
+    c->speed = clampf(c->speed, -d->vmax * 0.4f, d->vmax);
+    sf = clampf(c->speed / 6.0f, -1.0f, 1.0f);
+    c->yaw -= in->mx * 1.7f * sf * dt * (1.0f - 0.35f * fabsf(c->speed) / d->vmax);
+    fx = -sinf(c->yaw); fz = -cosf(c->yaw);
+    ox = c->x; oz = c->z;
+    c->x += fx * c->speed * dt; c->z += fz * c->speed * dt;
+    if (collide_bld(&c->x, &c->z, 1.9f)) {
+        float imp = fabsf(c->speed);
+        if (imp > 7.0f) c->hp -= (imp - 7.0f) * 3.0f;
+        c->speed *= -0.25f;
+    }
+    if (collide_trees(&c->x, &c->z, 1.2f)) { c->hp -= fabsf(c->speed) * 0.6f; c->speed *= 0.5f; }
+    c->x = clampf(c->x, -WORLD_HALF - 15, WORLD_HALF + 15);
+    c->z = clampf(c->z, -WORLD_HALF - 15, WORLD_HALF + 15);
+    (void)ox; (void)oz;
+    /* batidas em outros carros */
+    for (i = 0; i < MAX_CARS; i++) {
+        Car *o = &C[i];
+        float dx, dz, dd;
+        if (o == c || o->hp == 0.0f) continue;
+        dx = o->x - c->x; dz = o->z - c->z; dd = sqrtf(dx * dx + dz * dz);
+        if (dd < 3.8f && dd > 0.01f) {
+            float ov = 3.8f - dd, imp = fabsf(c->speed);
+            o->x += dx / dd * ov * 0.6f; o->z += dz / dd * ov * 0.6f;
+            c->x -= dx / dd * ov * 0.4f; c->z -= dz / dd * ov * 0.4f;
+            if (imp > 5.0f) { c->hp -= (imp - 5.0f) * 1.5f; o->hp -= (imp - 5.0f) * 2.0f; }
+            c->speed *= 0.6f;
+        }
+    }
+    /* atropelar zumbis */
+    for (i = 0; i < MAX_ZOMBIES; i++) {
+        Zombie *z = &Z[i];
+        if (!z->alive || z->hp <= 0) continue;
+        if (dist2(z->x, z->z, c->x + fx * 1.2f, c->z + fz * 1.2f) < 2.6f * 2.6f && fabsf(c->speed) > 5.0f) {
+            zombie_damage(z, fabsf(c->speed) * 9.0f, 1);
+            z->x += fx * 2.0f; z->z += fz * 2.0f;
+            c->hp -= 1.5f; c->speed *= 0.97f;
+        }
+    }
+    P.x = c->x; P.z = c->z; P.yaw = c->yaw; P.speed = fabsf(c->speed);
+    if (c->hp <= 0) {
+        c->hp = 0.0001f; c->state = 2; say("O carro foi destruido!");
+        exit_car(1);
+    }
+}
+
+static void update_prompt(void)
+{
+    int i;
+    float best = 1e9f;
+    G.prompt_kind = 0; G.prompt_idx = -1;
+    if (P.in_car >= 0) return;
+    for (i = 0; i < nsurv; i++)
+        if (S[i].state == 0) {
+            float d = dist2(P.x, P.z, S[i].x, S[i].z);
+            if (d < 3.5f * 3.5f && d < best) { best = d; G.prompt_kind = 1; G.prompt_idx = i; }
+        }
+    for (i = 0; i < MAX_CARS; i++)
+        if (C[i].hp > 0 && C[i].state == 0) {
+            float d = dist2(P.x, P.z, C[i].x, C[i].z);
+            if (d < 4.8f * 4.8f && d < best) { best = d; G.prompt_kind = 2; G.prompt_idx = i; }
+        }
+}
+
+static void do_interact(void)
+{
+    if (P.in_car >= 0) { exit_car(0); return; }
+    if (G.prompt_kind == 1) {
+        if (count_follow() >= MAX_FOLLOW) { say("Grupo cheio (%d)", MAX_FOLLOW); return; }
+        S[G.prompt_idx].state = 1; S[G.prompt_idx].inside = 0;
+        G.recruited++; sv.money += 100;
+        say("%s entrou no grupo! +$100", SURV_NAMES[S[G.prompt_idx].name]);
+    } else if (G.prompt_kind == 2) {
+        int i;
+        P.in_car = G.prompt_idx; C[P.in_car].state = 1;
+        for (i = 0; i < nsurv; i++) if (S[i].state == 1) S[i].inside = 1;
+        say("Dirigindo: %s", CARS[C[P.in_car].type].name);
+    }
+}
+
+static void sim_player_foot(const Input *in, float dt)
+{
+    const WeaponDef *w = &WEAP[P.weapon];
+    float turn = (in->b & PSP_CTRL_LTRIGGER) ? 0.9f : 2.3f;
+    float fx, fz, rx, rz, mx = in->mx, my = in->my, mag, spd;
+    int i;
+    P.yaw -= in->lx * turn * dt;
+    P.pitch = clampf(P.pitch + in->ly * 1.2f * dt, -1.0f, 1.0f);
+    P.aim = (in->b & PSP_CTRL_LTRIGGER) ? 1.0f : 0.0f;
+    fx = -sinf(P.yaw); fz = -cosf(P.yaw); rx = cosf(P.yaw); rz = -sinf(P.yaw);
+    mag = sqrtf(mx * mx + my * my);
+    if (mag > 1.0f) { mx /= mag; my /= mag; mag = 1.0f; }
+    spd = 4.2f;
+    if ((in->b & PSP_CTRL_CROSS) && P.stamina > 0 && my > 0.3f && P.aim < 0.5f) {
+        spd = 7.4f; P.stamina -= 26.0f * dt; P.stam_delay = 1.0f;
+        if (P.stamina < 0) P.stamina = 0;
+    } else {
+        P.stam_delay -= dt;
+        if (P.stam_delay <= 0) P.stamina = fminf(100.0f, P.stamina + 18.0f * dt);
+    }
+    if (P.aim > 0.5f) spd *= 0.55f;
+    P.speed = mag * spd;
+    P.x += (fx * my + rx * mx) * spd * dt;
+    P.z += (fz * my + rz * mx) * spd * dt;
+    collide_bld(&P.x, &P.z, 0.45f);
+    collide_trees(&P.x, &P.z, 0.4f);
+    for (i = 0; i < MAX_CARS; i++)
+        if (C[i].hp > 0) {
+            float dx = P.x - C[i].x, dz = P.z - C[i].z, d2 = dx * dx + dz * dz;
+            if (d2 < 2.1f * 2.1f && d2 > 1e-6f) { float d = sqrtf(d2); P.x = C[i].x + dx / d * 2.1f; P.z = C[i].z + dz / d * 2.1f; }
+        }
+    P.x = clampf(P.x, -WORLD_HALF - 15, WORLD_HALF + 15);
+    P.z = clampf(P.z, -WORLD_HALF - 15, WORLD_HALF + 15);
+    P.bob += P.speed * dt * 1.7f;
+
+    /* armas */
+    P.fire_cd -= dt;
+    P.flash = fmaxf(0.0f, P.flash - dt);
+    P.recoil = fmaxf(0.0f, P.recoil - dt * 0.9f);
+    P.bloom = fmaxf(0.0f, P.bloom - dt * 1.8f);
+    P.hitmark = fmaxf(0.0f, P.hitmark - dt);
+    if (P.reloading) {
+        P.reload_t -= dt;
+        if (P.reload_t <= 0) {
+            int need = w->mag - P.mag[P.weapon], take = need < P.reserve[P.weapon] ? need : P.reserve[P.weapon];
+            P.mag[P.weapon] += take; P.reserve[P.weapon] -= take; P.reloading = 0;
+        }
+    }
+    if ((in->p & PSP_CTRL_CIRCLE) && !P.reloading) {
+        int n = P.weapon;
+        for (i = 0; i < 3; i++) { n = (n + 1) % 3; if (sv.wown[n]) break; }
+        if (n != P.weapon) { P.weapon = n; P.fire_cd = 0.3f; say("%s", WEAP[n].name); }
+    }
+    if ((in->p & PSP_CTRL_SQUARE) && !P.reloading && P.mag[P.weapon] < w->mag && P.reserve[P.weapon] > 0) {
+        P.reloading = 1; P.reload_t = P.weapon == 1 ? 2.0f : 1.4f;
+    }
+    if (!P.reloading && P.fire_cd <= 0) {
+        int want = w->automatic ? (in->b & PSP_CTRL_RTRIGGER) : (in->p & PSP_CTRL_RTRIGGER);
+        if (want) {
+            if (P.mag[P.weapon] > 0) player_shoot();
+            else if (P.reserve[P.weapon] > 0) { P.reloading = 1; P.reload_t = 1.4f; }
+            else P.fire_cd = 0.3f;
+        }
+    }
+    if ((in->p & PSP_CTRL_SELECT) && P.medkits > 0 && P.hp < 100) {
+        P.medkits--; P.hp = fminf(100.0f, P.hp + 50.0f); say("Kit medico usado");
+    }
+    /* alvo sob a mira (para a cor da mira) */
+    {
+        float dx, dy, dz, best, tb;
+        fire_dir(P.yaw, P.pitch + P.recoil, 0, 0, &dx, &dy, &dz);
+        tb = ray_bld(P.x, 1.65f, P.z, dx, dy, dz, w->range);
+        best = tb; G.aim_hit = 0;
+        for (i = 0; i < MAX_ZOMBIES; i++) {
+            float t = ray_zombie(&Z[i], P.x, 1.65f, P.z, dx, dy, dz, best);
+            if (t >= 0 && t < best) { best = t; G.aim_hit = 1; }
+        }
+    }
+}
+
+static void sim_zombies(float dt)
+{
+    int i, j, k;
+    float tx = P.x, tz = P.z;
+    for (i = 0; i < MAX_ZOMBIES; i++) {
+        Zombie *z = &Z[i];
+        float spd, d, dx, dz, dmg, atkcd;
+        int tgt = -1;
+        if (!z->alive) continue;
+        if (z->hp <= 0) { z->deadt += dt; if (z->deadt > 3.0f) z->alive = 0; continue; }
+        z->hurt = fmaxf(0.0f, z->hurt - dt);
+        z->atk -= dt;
+        spd = z->type == 0 ? 2.0f : (z->type == 1 ? 4.2f : 1.7f);
+        spd *= fminf(1.5f, 1.0f + 0.03f * (float)G.wave);
+        dmg = z->type == 0 ? 8.0f : (z->type == 1 ? 6.0f : 18.0f);
+        atkcd = z->type == 1 ? 0.7f : 1.0f;
+        dx = tx - z->x; dz = tz - z->z; d = sqrtf(dx * dx + dz * dz);
+        for (j = 0; j < nsurv; j++)
+            if (S[j].state == 1 && !S[j].inside) {
+                float sx = S[j].x - z->x, sz = S[j].z - z->z, sd = sqrtf(sx * sx + sz * sz);
+                if (sd < d && sd < 12.0f) { d = sd; dx = sx; dz = sz; tgt = j; }
+            }
+        if (d < 60.0f && d > 0.01f) {
+            z->yaw = atan2f(-dx, -dz);
+            if (d > 1.25f) { z->x += dx / d * spd * dt; z->z += dz / d * spd * dt; z->anim += spd * dt * 1.8f; }
+            else if (z->atk <= 0) {
+                z->atk = atkcd;
+                if (tgt >= 0) S[tgt].hp -= dmg;
+                else player_hurt(dmg);
+            }
+            if (tgt < 0 && P.in_car >= 0 && d < 3.2f && d > 1.25f && z->atk <= 0) { z->atk = atkcd; player_hurt(dmg * 0.6f); }
+        } else {
+            z->wander -= dt;
+            if (z->wander <= 0) { z->yaw = frand() * 2 * PI; z->wander = frange(2, 6); }
+            z->x += -sinf(z->yaw) * 0.7f * dt; z->z += -cosf(z->yaw) * 0.7f * dt; z->anim += dt * 1.2f;
+        }
+        collide_bld(&z->x, &z->z, 0.4f);
+        for (k = 0; k < MAX_CARS; k++)
+            if (C[k].hp > 0 && !(P.in_car == k)) {
+                float cx = z->x - C[k].x, cz = z->z - C[k].z, cd = cx * cx + cz * cz;
+                if (cd < 2.0f * 2.0f && cd > 1e-6f) { cd = sqrtf(cd); z->x = C[k].x + cx / cd * 2.0f; z->z = C[k].z + cz / cd * 2.0f; }
+            }
+        for (j = i + 1; j < MAX_ZOMBIES; j++)
+            if (Z[j].alive && Z[j].hp > 0) {
+                float sx = Z[j].x - z->x, sz = Z[j].z - z->z, sd = sx * sx + sz * sz;
+                if (sd < 0.64f && sd > 1e-6f) {
+                    sd = sqrtf(sd);
+                    z->x -= sx / sd * 0.02f; z->z -= sz / sd * 0.02f; Z[j].x += sx / sd * 0.02f; Z[j].z += sz / sd * 0.02f;
+                }
+            }
+    }
+}
+
+static void sim_survivors(float dt)
+{
+    int i, j, idx = 0;
+    for (i = 0; i < nsurv; i++) {
+        Survivor *s = &S[i];
+        if (s->state == 2) continue;
+        if (s->hp <= 0) { s->state = 2; say("%s morreu!", SURV_NAMES[s->name]); continue; }
+        s->flash = fmaxf(0.0f, s->flash - dt);
+        s->cool -= dt;
+        if (s->state == 0) { s->anim = 0; continue; }
+        idx++;
+        if (s->inside) { s->x = P.x; s->z = P.z; continue; }
+        {
+            float dx = P.x - s->x, dz = P.z - s->z, d = sqrtf(dx * dx + dz * dz), spd = 5.2f;
+            float bestd = 24.0f * 24.0f;
+            int bz = -1;
+            if (d > 3.5f) {
+                if (d > 14.0f) spd = 8.0f;
+                s->x += dx / d * spd * dt; s->z += dz / d * spd * dt; s->anim += spd * dt * 1.6f;
+                s->yaw = atan2f(-dx, -dz);
+            }
+            if (d > 60.0f) { s->x = P.x + 2.0f; s->z = P.z + 2.0f; } /* teleporta se ficou muito longe */
+            collide_bld(&s->x, &s->z, 0.4f);
+            for (j = 0; j < MAX_ZOMBIES; j++)
+                if (Z[j].alive && Z[j].hp > 0) {
+                    float dd = dist2(s->x, s->z, Z[j].x, Z[j].z);
+                    if (dd < bestd) { bestd = dd; bz = j; }
+                }
+            if (bz >= 0 && s->cool <= 0) {
+                float ex = Z[bz].x - s->x, ez = Z[bz].z - s->z, el = sqrtf(ex * ex + ez * ez);
+                if (el > 0.1f && ray_bld(s->x, 1.4f, s->z, ex / el, 0, ez / el, el) >= el - 0.01f) {
+                    s->yaw = atan2f(-ex, -ez);
+                    if (frand() < 0.75f) zombie_damage(&Z[bz], 24.0f, 1);
+                    s->flash = 0.08f; s->cool = frange(0.7f, 1.2f);
+                }
+            }
+        }
+    }
+    (void)idx;
+}
+
+static void sim_play(const Input *in, float dt)
+{
+    int i, alive = 0, cap;
+    G.time += dt;
+    G.msg_t -= dt;
+    P.dmg_flash = fmaxf(0.0f, P.dmg_flash - dt);
+    if (P.in_car >= 0) {
+        P.aim = 0.0f; P.hitmark = 0; P.pitch = clampf(P.pitch + in->ly * 1.0f * dt, -0.6f, 0.6f);
+        G.prompt_kind = 0;
+        car_update_driven(&C[P.in_car], in, dt);
+        P.bob += P.speed * dt * 0.8f;
+        if (in->p & PSP_CTRL_TRIANGLE) do_interact();
+    } else {
+        update_prompt();
+        if (in->p & PSP_CTRL_TRIANGLE) do_interact();
+        sim_player_foot(in, dt);
+    }
+    sim_zombies(dt);
+    sim_survivors(dt);
+    /* ondas */
+    G.wave_t += dt;
+    if (G.wave_t > 75.0f) { G.wave++; G.wave_t = 0; sv.money += 50 * G.wave; say("ONDA %d! +$%d", G.wave, 50 * G.wave); }
+    for (i = 0; i < MAX_ZOMBIES; i++) {
+        if (Z[i].alive && Z[i].hp > 0) {
+            alive++;
+            if (dist2(Z[i].x, Z[i].z, P.x, P.z) > 200.0f * 200.0f && alive > 6) { Z[i].alive = 0; alive--; }
+        }
+    }
+    cap = 8 + G.wave * 4; if (cap > MAX_ZOMBIES - 2) cap = MAX_ZOMBIES - 2;
+    G.spawn_t -= dt;
+    if (G.spawn_t <= 0 && alive < cap) {
+        spawn_near(P.x, P.z, 50.0f, 90.0f, pick_ztype());
+        G.spawn_t = fmaxf(0.4f, 3.0f - 0.3f * (float)G.wave);
+    }
+    net_tick(dt);
+    if (P.hp <= 0) P.hp = 0;
+}
+
+/*------------------------------ jogo: render ------------------------*/
+typedef struct { unsigned int shirt, pants, skin; float wf, hf; int zombie; } Style;
+
+static void person(float x, float z, float yaw, float anim, float squash, const Style *st, int flash)
+{
+    float sw = sinf(anim) * 0.22f, wf = st->wf, hf = st->hf * squash;
+    unsigned int shirt = flash ? RGB(220, 60, 60) : st->shirt;
+    box_rel(x, z, yaw, -0.14f * wf, 0, sw, 0.24f * wf, 0.8f * hf, 0.26f * wf, st->pants);
+    box_rel(x, z, yaw,  0.14f * wf, 0, -sw, 0.24f * wf, 0.8f * hf, 0.26f * wf, st->pants);
+    box_rel(x, z, yaw, 0, 0.8f * hf, 0, 0.56f * wf, 0.62f * hf, 0.30f * wf, shirt);
+    box_rel(x, z, yaw, 0, 1.42f * hf, 0, 0.30f * wf, 0.30f * hf, 0.30f * wf, st->skin);
+    if (st->zombie) {
+        box_rel(x, z, yaw, -0.38f * wf, 1.12f * hf, -0.36f * wf, 0.16f * wf, 0.16f * hf, 0.70f * wf, st->skin);
+        box_rel(x, z, yaw,  0.38f * wf, 1.12f * hf, -0.36f * wf, 0.16f * wf, 0.16f * hf, 0.70f * wf, st->skin);
+    } else {
+        box_rel(x, z, yaw, -0.38f * wf, 0.8f * hf, -sw * 0.6f, 0.16f * wf, 0.62f * hf, 0.18f * wf, shirt);
+        box_rel(x, z, yaw,  0.38f * wf, 0.8f * hf,  sw * 0.6f, 0.16f * wf, 0.62f * hf, 0.18f * wf, shirt);
+    }
+}
+
+static void marker(float x, float z, float h, unsigned int col)
+{
+    float t = G.time * 3.0f;
+    box(x, h + sinf(t) * 0.12f, z, 0.22f, 0.22f, 0.22f, t * 0.5f, col);
+}
+
+static void car_bb(float x, float z, int type, float yaw, unsigned int col)
+{
+    float rx = cam_cs, rz = -cam_sn, hw = 3.0f, hh = 3.0f, fx = -sinf(yaw), fz = -cosf(yaw);
+    int flip = (fx * rx + fz * rz) > 0.0f;
+    float p[12];
+    p[0] = x - rx * hw; p[1] = 0;  p[2] = z - rz * hw;
+    p[3] = x + rx * hw; p[4] = 0;  p[5] = z + rz * hw;
+    p[6] = x + rx * hw; p[7] = hh; p[8] = z + rz * hw;
+    p[9] = x - rx * hw; p[10] = hh; p[11] = z - rz * hw;
+    tex_bind(T_CAR + type, 0, 0);
+    quad1(p, flip ? 1.0f : 0.0f, 0.0f, flip ? 0.0f : 1.0f, 1.0f, col);
+}
+
+static void begin3d(float fov)
+{
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_GEQUAL);
+    sceGuDisable(GU_BLEND);
+    sceGuDisable(GU_ALPHA_TEST);
+    sceGuEnable(GU_FOG);
+    sceGuFog(50.0f, 200.0f, FOG_COL);
     sceGumMatrixMode(GU_PROJECTION);
     sceGumLoadIdentity();
-    sceGumPerspective(70.0f, 16.0f / 9.0f, 1.0f, 200.0f);
+    sceGumPerspective(fov, (float)SCR_W / (float)SCR_H, 0.25f, 400.0f);
     sceGumMatrixMode(GU_VIEW);
     sceGumLoadIdentity();
-    ScePspFVector3 eye = { px - sinf(cam) * 11.0f, 7.0f, pz - cosf(cam) * 11.0f };
-    ScePspFVector3 ctr = { px, 1.5f, pz };
-    ScePspFVector3 up  = { 0, 1, 0 };
-    sceGumLookAt(&eye, &ctr, &up);
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+}
 
-    sceGuEnable(GU_LIGHTING);
-    sceGuEnable(GU_LIGHT0);
-    ScePspFVector3 dir = { 0.4f, 1.0f, 0.3f };
-    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE, &dir);
-    unsigned int lc = 0xff000000 | ((unsigned int)(165 * b) << 16) | ((unsigned int)(165 * b) << 8) | (unsigned int)(165 * b);
-    sceGuLightColor(0, GU_DIFFUSE, lc);
-    sceGuAmbient(0xff000000 | ((unsigned int)(105 * b) << 16) | ((unsigned int)(105 * b) << 8) | (unsigned int)(105 * b));
-    sceGuColorMaterial(GU_AMBIENT | GU_DIFFUSE);
+static void draw_ground(void)
+{
+    int tx, tz, k, i;
+    unsigned int white = RGB(255, 255, 255);
+    sceGuDisable(GU_DEPTH_TEST);
+    tex_bind(T_GROUND, 1, 1);
+    for (tx = -11; tx < 11; tx++)
+        for (tz = -11; tz < 11; tz++) {
+            float x0 = tx * 40.0f, z0 = tz * 40.0f, p[12];
+            if (dist2(x0 + 20, z0 + 20, cam_x, cam_z) > 200.0f * 200.0f || !visible(x0 + 20, z0 + 20, 30)) continue;
+            p[0] = x0; p[1] = 0; p[2] = z0; p[3] = x0 + 40; p[4] = 0; p[5] = z0;
+            p[6] = x0 + 40; p[7] = 0; p[8] = z0 + 40; p[9] = x0; p[10] = 0; p[11] = z0 + 40;
+            quad1(p, 0, 0, 10, 10, white);
+        }
+    tex_bind(T_ROAD, 1, 1);
+    for (k = -4; k <= 4; k++) {
+        float L = k * 100.0f;
+        for (i = 0; i < 16; i++) {
+            float s0 = -400.0f + i * 50.0f, s1 = s0 + 50.0f, sc = (s0 + s1) * 0.5f, p[12];
+            if (dist2(L, sc, cam_x, cam_z) < 200.0f * 200.0f && visible(L, sc, 40)) {
+                p[0] = L - 7; p[1] = 0; p[2] = s0; p[3] = L + 7; p[4] = 0; p[5] = s0;
+                p[6] = L + 7; p[7] = 0; p[8] = s1; p[9] = L - 7; p[10] = 0; p[11] = s1;
+                quad1(p, 0, 0, 1, 50.0f / 16.0f, white);
+            }
+            if (dist2(sc, L, cam_x, cam_z) < 200.0f * 200.0f && visible(sc, L, 40)) {
+                p[0] = s0; p[1] = 0; p[2] = L - 7; p[3] = s0; p[4] = 0; p[5] = L + 7;
+                p[6] = s1; p[7] = 0; p[8] = L + 7; p[9] = s1; p[10] = 0; p[11] = L - 7;
+                quad1(p, 0, 0, 1, 50.0f / 16.0f, white);
+            }
+        }
+    }
+    sceGuEnable(GU_DEPTH_TEST);
+}
 
-    groundC1 = 0xff2e7a3e; groundC2 = 0xff296f38;
+static void bld_sides(const Bld *b)
+{
+    float h = b->h, w = b->x1 - b->x0, d = b->z1 - b->z0, p[12];
+    Vtx *v = (Vtx *)sceGuGetMemory(24 * sizeof(Vtx)), *q = v;
+    p[0] = b->x1; p[1] = 0; p[2] = b->z0; p[3] = b->x0; p[4] = 0; p[5] = b->z0;
+    p[6] = b->x0; p[7] = h; p[8] = b->z0; p[9] = b->x1; p[10] = h; p[11] = b->z0;
+    q = put_quad(q, p, 0, 0, w / 8.0f, h / 8.0f, shade(b->col, 0.80f));
+    p[0] = b->x1; p[1] = 0; p[2] = b->z1; p[3] = b->x1; p[4] = 0; p[5] = b->z0;
+    p[6] = b->x1; p[7] = h; p[8] = b->z0; p[9] = b->x1; p[10] = h; p[11] = b->z1;
+    q = put_quad(q, p, 0, 0, d / 8.0f, h / 8.0f, shade(b->col, 0.68f));
+    p[0] = b->x0; p[1] = 0; p[2] = b->z1; p[3] = b->x1; p[4] = 0; p[5] = b->z1;
+    p[6] = b->x1; p[7] = h; p[8] = b->z1; p[9] = b->x0; p[10] = h; p[11] = b->z1;
+    q = put_quad(q, p, 0, 0, w / 8.0f, h / 8.0f, shade(b->col, 0.92f));
+    p[0] = b->x0; p[1] = 0; p[2] = b->z0; p[3] = b->x0; p[4] = 0; p[5] = b->z1;
+    p[6] = b->x0; p[7] = h; p[8] = b->z1; p[9] = b->x0; p[10] = h; p[11] = b->z0;
+    put_quad(q, p, 0, 0, d / 8.0f, h / 8.0f, shade(b->col, 0.60f));
+    sceGuDrawArray(GU_TRIANGLES, VT3D, 24, 0, v);
+}
+
+static void draw_world(void)
+{
+    static int visb[MAX_BLD];
+    int i, nv = 0;
     draw_ground();
-    draw_world_pois();
-    draw_base();
-
-    /* caixas de saque */
-    for (int i = 0; i < nloot; i++) {
-        Loot *L = &loot[i];
-        if (L->looted) continue;
-        float d = dist2d(px, pz, L->x, L->z);
-        if (L->kind == 3) {
-            if (d < 95.0f) box(L->x, 0, L->z, 0.5f, 14.0f, 0.5f, 0, 0xff30e0ff);
-            if (d < 70.0f) box(L->x, 0, L->z, 1.0f, 0.8f, 1.0f, 0, 0xff30c0ff);
-        } else if (d < 40.0f && L->kind != 1) {
-            box(L->x, 0, L->z, 0.9f, 0.7f, 0.9f, 0, 0xff3a6a9a);
-            box(L->x, 0.9f + 0.15f * sinf(gameTime * 3.0f + i), L->z, 0.35f, 0.35f, 0.35f, 0, L->kind == 2 ? 0xff40e040 : 0xff30e0ff);
-        } else if (d < 25.0f && L->kind == 1) {
-            box(L->x - 2.2f, 2.0f + 0.15f * sinf(gameTime * 3.0f + i), L->z - 1.0f, 0.35f, 0.35f, 0.35f, 0, 0xff30e0ff);
-        }
+    /* predios e caixotes */
+    for (i = 0; i < nbld; i++) {
+        const Bld *b = &blds[i];
+        float cx = (b->x0 + b->x1) * 0.5f, cz = (b->z0 + b->z1) * 0.5f;
+        float r = sqrtf((b->x1 - b->x0) * (b->x1 - b->x0) + (b->z1 - b->z0) * (b->z1 - b->z0)) * 0.5f;
+        if (dist2(cx, cz, cam_x, cam_z) > 210.0f * 210.0f || !visible(cx, cz, r)) continue;
+        visb[nv++] = i;
     }
-
-    /* armas coletaveis no chao */
-    for (int i = 0; i < NWP; i++) {
-        WPick *wp = &wpick[i];
-        if (wp->taken) continue;
-        float d = dist2d(px, pz, wp->x, wp->z);
-        if (d > 60.0f) continue;
-        float by = 0.9f + 0.12f * sinf(gameTime * 2.5f + i);
-        draw_weapon(wp->w, wp->x, by, wp->z, gameTime * 1.5f, -1.5708f, 0.0f);
-        box(wp->x, 0.0f, wp->z, 0.9f, 0.08f, 0.9f, 0, 0xffe0e040);
-        if (d < 45.0f) box(wp->x, 0.0f, wp->z, 0.12f, 6.0f, 0.12f, 0, 0xffe0e040);
-    }
-
-    /* arvores */
-    for (int i = 0; i < NTREES; i++) {
-        float tdx = treeX[i] - px, tdz = treeZ[i] - pz;
-        if (tdx * tdx + tdz * tdz > 55.0f * 55.0f) continue;
-        box(treeX[i], 0, treeZ[i], 0.7f, treeH[i], 0.7f, 0, 0xff203848);
-        if (i % 4 == 0) box(treeX[i] + 0.5f, treeH[i] - 1.2f, treeZ[i], 1.4f, 0.25f, 0.25f, 0.5f, 0xff203848);
-        else box(treeX[i], treeH[i] - 0.6f, treeZ[i], 3.0f, 2.6f, 3.0f, 0.4f * i, (i % 3 == 0) ? 0xff1c5a30 : 0xff1a4a28);
-    }
-
-    /* efeitos de combate */
-    if (swingT > 0) {
-        float fx = sinf(pang), fz = cosf(pang);
-        box(px + fx * 1.6f, 0.9f, pz + fz * 1.6f, 1.6f, 0.15f, 0.3f, pang + 1.57f + swingT * 8.0f, 0xffe0f0ff);
-    }
-    if (shotT > 0) {
-        float mx = (shotX1 + shotX2) * 0.5f, mz = (shotZ1 + shotZ2) * 0.5f, len = dist2d(shotX1, shotZ1, shotX2, shotZ2);
-        box(mx, 1.2f, mz, 0.08f, 0.08f, len, atan2f(shotX2 - shotX1, shotZ2 - shotZ1), 0xff60f0ff);
-        box(shotX1, 1.1f, shotZ1, 0.4f, 0.4f, 0.4f, 0, 0xff30e0ff);
-    }
-
-    /* sombras */
-    box(px, 0.1f, pz, 1.0f, 0.02f, 0.6f, 0, 0xff000000);
-    for (int i = 0; i < NZ; i++)
-        if (zomb[i].active && zomb[i].state != 2 && NEAR(zomb[i].x, zomb[i].z, 50))
-            box(zomb[i].x, 0.1f, zomb[i].z, 1.0f * Z_K[zomb[i].type], 0.02f, 0.7f * Z_K[zomb[i].type], 0, 0xff000000);
-
-    /* zumbis em 3D */
-    for (int i = 0; i < NZ; i++) {
-        Zomb *z = &zomb[i];
-        if (!z->active) continue;
-        float d = dist2d(px, pz, z->x, z->z);
-        if (d > 60.0f) continue;
-        float k = Z_K[z->type];
-        if (z->state == 2) { if (z->corpse > 0) draw_corpse(z->x, z->z, z->ang, k, &HPAL_Z[z->type]); continue; }
-        float ph = gameTime * (z->state == 1 ? 7.0f : 2.5f) + i * 1.7f;
-        float sw = sinf(ph) * (z->state == 1 ? 0.8f : 0.35f);
-        float arm = -1.35f + sinf(ph * 0.7f) * 0.15f;
-        if (z->atk > 0.6f) arm = -1.95f + sinf(gameTime * 20.0f) * 0.2f;
-        draw_humanoid(z->x, z->z, z->ang, k, z->hurt > 0 ? &HPAL_HIT : &HPAL_Z[z->type], sw, arm, arm, 0, d > 38.0f, 0);
-    }
-
-    /* jogador em 3D */
-    {
-        float sw = moving ? sinf(walkPhase) * 0.8f : 0.0f, aR, aL;
-        if (curW >= 4) { aR = -1.45f + (shotT > 0 ? 0.18f : 0.0f); aL = -1.25f; }
-        else {
-            aR = -0.7f - sw * 0.4f; aL = sw * 0.6f;
-            if (swingT > 0) aR = -2.6f + (1.0f - swingT / 0.18f) * 2.8f;
-        }
-        if (mode == 3) draw_corpse(px, pz, pang, 1.0f, &HPAL_PLAYER);
-        else draw_humanoid(px, pz, pang, rollT > 0 ? 0.8f : 1.0f, hurtT > 0.25f ? &HPAL_HIT : &HPAL_PLAYER, sw, aL, aR, curW, 0, 1);
-    }
-
-    /* na tela de titulo: zumbis ao lado, olhando para o personagem */
-    if (appState != APP_PLAY && appState != APP_SPLASH && appState != APP_POST) {
-        float rx = -cosf(cam), rz = sinf(cam), fx2 = sinf(cam), fz2 = cosf(cam);
-        float sw = sinf(appT * 3.0f) * 0.3f;
-        float zx = px - rx * 8.0f + fx2 * 1.0f, zz = pz - rz * 8.0f + fz2 * 1.0f;
-        draw_humanoid(zx, zz, atan2f(px - zx, pz - zz), 1.0f, &HPAL_Z[0], sw, -1.35f, -1.35f, 0, 0, 0);
-        float wx = px + rx * 8.5f + fx2 * 2.0f, wz = pz + rz * 8.5f + fz2 * 2.0f;
-        draw_humanoid(wx, wz, atan2f(px - wx, pz - wz), 1.45f, &HPAL_Z[2], -sw, -1.35f, -1.35f, 0, 0, 0);
-    }
-    sceGuDisable(GU_LIGHTING);
-}
-
-/* ---------- interface ---------- */
-static void window(int x0, int y0, int x1, int y1) {
-    rect2d(x0, y0, x1, y1, 0xf060c0f0);
-    rect2d(x0 + 4, y0 + 4, x1 - 4, y1 - 4, 0xf0201008);
-}
-static void ui_center(int y, int sc, unsigned int col, const char *str) {
-    ui_text((480 - (int)strlen(str) * 6 * sc) / 2, y, sc, col, str);
-}
-static void bar(int x, int y, int w, int h, float v, unsigned int col) {
-    if (v < 0) v = 0;
-    if (v > 100) v = 100;
-    rect2d(x - 1, y - 1, x + w + 1, y + h + 1, 0xff000000);
-    rect2d(x, y, x + w, y + h, 0xff383838);
-    if (v > 0) rect2d(x, y, x + (int)(w * v / 100.0f), y + h, col);
-}
-
-static void minimap_dot(float wx, float wz, int sz, unsigned int col, int clampEdge) {
-    const int X0 = 408, Y0 = 4, S = 68; const float k = (S / 2.0f) / 60.0f;
-    float dx = wx - px, dz = wz - pz;
-    float sx = (dx * (-cosf(cam)) + dz * sinf(cam)) * k, sy = (dx * sinf(cam) + dz * cosf(cam)) * k;
-    float lim = S / 2.0f - 3.0f;
-    if (sx > lim || sx < -lim || sy > lim || sy < -lim) {
-        if (!clampEdge) return;
-        float m = fmaxf(fabsf(sx), fabsf(sy)); sx = sx / m * lim; sy = sy / m * lim;
-    }
-    int ix = X0 + S / 2 + (int)sx, iy = Y0 + S / 2 - (int)sy;
-    rect2d(ix - sz / 2, iy - sz / 2, ix + sz - sz / 2, iy + sz - sz / 2, col);
-}
-
-static void draw_minimap(void) {
-    rect2d(406, 2, 478, 74, 0xe0000000);
-    rect2d(408, 4, 476, 72, 0xff2a3a2a);
-    minimap_dot(BASE_X, BASE_Z, 4, 0xff40d040, 1);
-    if (rescue > 0) minimap_dot(HELI_X, HELI_Z, 4, 0xffe08040, 1);
-    for (int i = 0; i < nloot; i++) if (loot[i].kind == 3 && !loot[i].looted) minimap_dot(loot[i].x, loot[i].z, 3, 0xff30e0ff, 1);
-    for (int i = 0; i < NWP; i++) if (!wpick[i].taken) minimap_dot(wpick[i].x, wpick[i].z, 3, 0xffe040e0, 0);
-    for (int i = 0; i < NZ; i++) if (zomb[i].active && zomb[i].state != 2) minimap_dot(zomb[i].x, zomb[i].z, 2, zomb[i].state == 1 ? 0xff2020ff : 0xff3030a0, 0);
-    rect2d(440, 36, 445, 41, 0xffffffff);
-}
-
-static void draw_ui(void) {
-    char buf[96];
-    sceGuDisable(GU_DEPTH_TEST);
-    sceGuEnable(GU_BLEND);
-    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
-
-    /* barras de status */
-    rect2d(0, 0, 204, 84, 0x90000000);
-    ui_text(4, 4, 1, 0xffffffff, "VIDA");  bar(44, 4, 150, 7, hp, 0xff3030e0);
-    ui_text(4, 16, 1, 0xffffffff, "FOME"); bar(44, 16, 150, 7, hunger, 0xff30a0f0);
-    ui_text(4, 28, 1, 0xffffffff, "SEDE"); bar(44, 28, 150, 7, thirst, 0xffe08030);
-    ui_text(4, 40, 1, 0xffffffff, "ENER"); bar(44, 40, 150, 7, stam, 0xff40d0a0);
-    int hh = (int)hour_now(), mm = (int)((hour_now() - hh) * 60.0f);
-    sprintf(buf, "Dia %d  %02d:%02d  Abates:%d", day_number(), hh, mm, kills);
-    ui_text(4, 54, 1, 0xffc0ffc0, buf);
-    if (rescue == 0) { if (parts < 4) sprintf(buf, "Obj: achar pecas de radio %d/4", parts); else strcpy(buf, "Obj: use o radio no acampamento"); }
-    else if (rescue == 1) strcpy(buf, "Obj: sobreviva ate o resgate!");
-    else strcpy(buf, "Obj: embarque no helicoptero!");
-    ui_text(4, 66, 1, 0xff40e0ff, buf);
-    draw_minimap();
-    rect2d(330, 76, 476, 100, 0x90000000);
-    if (wAmmo[curW] >= 0) sprintf(buf, "%s  %s:%d", wName[curW], itemName[wAmmo[curW]], inv[wAmmo[curW]]); else strcpy(buf, wName[curW]);
-    ui_text(334, 80, 1, 0xffffffff, buf);
-    { static const int ci[3] = { I_COM, I_AGUA, I_BAND };
-      sprintf(buf, "< %s x%d >  Cima: usar", itemName[ci[selUse]], inv[ci[selUse]]);
-      ui_text(334, 90, 1, 0xffc0c0c0, buf); }
-    if (rescue == 1 || rescue == 2) {
-        rect2d(210, 4, 402, 24, 0xb0000000);
-        if (rescue == 1) sprintf(buf, "RESGATE: helicoptero em %ds!", (int)rescueT + 1);
-        else sprintf(buf, "HELICOPTERO: embarque em %ds!", (int)rescueT + 1);
-        ui_text(214, 10, 1, 0xff40e0ff, buf);
-    }
-
-    if (mode == 0) {
-        if (showHelp) {
-            rect2d(0, 86, 250, 126, 0x90000000);
-            ui_text(4, 90, 1, 0xffffffff, "Analog:andar  L/R:camera  X:interagir");
-            ui_text(4, 100, 1, 0xffffffff, "Quad:atacar  Circ:rolar  Tri:trocar arma");
-            ui_text(4, 110, 1, 0xffffffff, "Esq/Dir:item  Cima:usar  START:menu");
-            ui_text(4, 118, 1, 0xff909090, "SELECT: esconder ajuda");
-        }
-        if (msgTimer > 0) {
-            int w = (int)strlen(msg) * 12; if (w > 470) w = 470;
-            int x = (480 - w) / 2;
-            rect2d(x - 6, 186, x + w + 6, 208, 0xa0000000);
-            ui_text(x, 190, 2, 0xffffffff, msg);
-        }
-        const char *pr = NULL; char pb[64];
-        if (near_heli()) pr = "X: embarcar no helicoptero!";
-        else if (near_camp()) pr = "ACAMPAMENTO  X: abrir";
-        else if (nearest_wpick() >= 0) { sprintf(pb, "X: pegar %s", wName[wpick[nearest_wpick()].w]); pr = pb; }
-        else {
-            int l = nearest_loot();
-            if (l >= 0) pr = loot[l].kind == 3 ? "X: pegar peca de radio!" : (loot[l].kind == 1 ? "X: revistar carro" : "X: revistar");
-            else if (near_lake()) pr = "X: beber agua";
-            else {
-                float dd; int zi = nearest_zombie(5.0f, &dd);
-                if (zi >= 0) { sprintf(pb, "Zumbi perto! Quad: atacar"); pr = pb; }
-            }
-        }
-        if (pr) {
-            int w = (int)strlen(pr) * 12, x = (480 - w) / 2;
-            rect2d(x - 6, 238, x + w + 6, 266, 0xa0000000);
-            ui_text(x, 245, 2, 0xff40e0ff, pr);
-        }
-        if (hurtT > 0) rect2d(0, 0, 480, 272, ((unsigned int)(hurtT / 0.4f * 110.0f) << 24) | 0x000000ff);
-        if (hp < 25 && ((int)(gameTime * 3.0f) & 1)) rect2d(0, 0, 480, 272, 0x300000ff);
-    } else if (mode == 1) {
-        static const char *opt[6] = { "Continuar", "", "", "Salvar e ir ao menu", "Menu sem salvar", "Sair do jogo" };
-        rect2d(0, 0, 480, 272, 0x80000000);
-        window(96, 30, 384, 242);
-        ui_text(180, 38, 2, 0xff40e0ff, "== MENU ==");
-        sprintf(buf, "%s - slot %d - %s", survNames[nameIdx], curSlot + 1, diffNames[difficulty]);
-        ui_text(108, 56, 1, 0xffc0c0c0, buf);
-        for (int i = 0; i < 6; i++) {
-            int y = 68 + i * 20;
-            if (i == menuSel) rect2d(106, y - 3, 374, y + 17, 0xc0a06020);
-            if (i == 1) sprintf(buf, "%s Musica: %s", i == menuSel ? ">" : " ", musicOn ? "ligada" : "desligada");
-            else if (i == 2) sprintf(buf, "%s Salvar (slot %d)", i == menuSel ? ">" : " ", curSlot + 1);
-            else sprintf(buf, "%s %s", i == menuSel ? ">" : " ", opt[i]);
-            ui_text(110, y, 2, 0xffffffff, buf);
-        }
-        ui_text(108, 194, 1, 0xffc0c0c0, "Cima/Baixo + X     START volta");
-        if (menuMsg[0]) ui_text(110, 208, 2, 0xff60ff60, menuMsg);
-    } else if (mode == 2) {
-        rect2d(0, 0, 480, 272, 0x80000000);
-        window(36, 24, 444, 254);
-        ui_text(150, 30, 2, 0xff40e0ff, "== ACAMPAMENTO ==");
-        for (int i = 0; i < 7; i++) {
-            int y = 54 + i * 21;
-            if (i == menuSel) rect2d(46, y - 3, 434, y + 16, 0xc0a06020);
-            if (i == 0) strcpy(buf, "Bandagem (2 Pano)");
-            else if (i == 1) strcpy(buf, "Municao x6 (2 Sucata)");
-            else if (i == 2) strcpy(buf, "Cartuchos x4 (3 Sucata)");
-            else if (i == 3) strcpy(buf, "Balas de rifle x3 (4 Sucata)");
-            else if (i == 4) strcpy(buf, "Dormir ate amanhecer");
-            else if (i == 5) sprintf(buf, "Radio: chamar resgate (%d/4)", parts);
-            else strcpy(buf, "Sair");
-            ui_text(56, y, 2, 0xffffffff, buf);
-        }
-        sprintf(buf, "Madeira:%d Sucata:%d Pano:%d Bandagem:%d Pecas:%d/4", inv[I_MAD], inv[I_SUC], inv[I_PANO], inv[I_BAND], parts);
-        ui_text(46, 204, 1, 0xffc0ffc0, buf);
-        sprintf(buf, "Municao:%d Cartuchos:%d Balas rifle:%d Comida:%d Agua:%d", inv[I_MUN], inv[I_CART], inv[I_RIFLE], inv[I_COM], inv[I_AGUA]);
-        ui_text(46, 214, 1, 0xffc0ffc0, buf);
-        ui_text(46, 224, 1, 0xffc0c0c0, "Cima/Baixo + X escolhe   START/O sai");
-        if (menuMsg[0]) ui_text(46, 235, 2, 0xff60ff60, menuMsg);
-    } else if (mode == 3) {
-        rect2d(0, 0, 480, 272, 0xc0000020);
-        ui_center(80, 4, 0xff2020e0, "VOCE MORREU");
-        sprintf(buf, "Zumbis derrubados: %d    Mortes: %d", kills, deaths);
-        ui_center(130, 1, 0xffc0c0c0, buf);
-        if (deathT > 1.2f) {
-            ui_center(160, 2, 0xffffffff, "X: renascer no acampamento");
-            ui_center(190, 1, 0xffc0c0c0, "Voce perde metade dos itens ao renascer.");
-        }
-    }
-
-    sceGuDisable(GU_BLEND);
-    sceGuEnable(GU_DEPTH_TEST);
-}
-
-/* ---------- telas: abertura, titulo, novo jogo, carregar, creditos ---------- */
-typedef struct { const char *t; int sc; unsigned int col; } CLine;
-static const CLine CREDITS[] = {
-    { "SOBREVIVENDO EM GS", 3, 0xff40e0ff },
-    { "", 1, 0 },
-    { "Um jogo desenvolvido por", 2, 0xffffffff },
-    { "MECANIC ENGINE GAMER", 3, 0xfff0e040 },
-    { "", 1, 0 },
-    { "Direcao de jogo", 1, 0xffc0c0c0 },
-    { "MECANIC ENGINE GAMER", 2, 0xffffffff },
-    { "", 1, 0 },
-    { "Arte e personagens", 1, 0xffc0c0c0 },
-    { "MECANIC ENGINE GAMER", 2, 0xffffffff },
-    { "", 1, 0 },
-    { "Musica e efeitos sonoros", 1, 0xffc0c0c0 },
-    { "MECANIC ENGINE GAMER", 2, 0xffffffff },
-    { "", 1, 0 },
-    { "Programacao", 1, 0xffc0c0c0 },
-    { "MECANIC ENGINE GAMER", 2, 0xffffffff },
-    { "", 1, 0 },
-    { "Sobreviventes", 1, 0xffc0c0c0 },
-    { "Rafa  Bia  Leo  Ana  Dudu  Nina  Caio  Lia", 1, 0xffffffff },
-    { "", 1, 0 },
-    { "Feito para PSP e PPSSPP", 2, 0xffffffff },
-    { "", 1, 0 },
-    { "", 1, 0 },
-    { "Obrigado por jogar!", 3, 0xff40e0ff }
-};
-#define NCRED ((int)(sizeof(CREDITS) / sizeof(CREDITS[0])))
-static int cred_h(const CLine *l) { return l->sc * 8 + (l->sc >= 2 ? 10 : 6); }
-static int credits_height(void) { int h = 0; for (int i = 0; i < NCRED; i++) h += cred_h(&CREDITS[i]); return h; }
-
-static void draw_heli_art(int x, int y, int blink) {
-    rect2d(x, y + 6, x + 60, y + 26, 0xff405030);
-    rect2d(x + 40, y + 9, x + 56, y + 18, 0xffe0c080);
-    rect2d(x - 36, y + 10, x, y + 16, 0xff405030);
-    rect2d(x - 40, y + 2, x - 34, y + 20, 0xff304020);
-    rect2d(x - 14, y, x + 74, y + 3, 0xff202020);
-    rect2d(x + 28, y + 3, x + 32, y + 6, 0xff202020);
-    rect2d(x + 4, y + 28, x + 56, y + 31, 0xff202020);
-    if (blink) rect2d(x + 26, y - 4, x + 32, y, 0xff2020ff);
-}
-
-static void draw_app_ui(void) {
-    char buf[96];
-    sceGuDisable(GU_DEPTH_TEST);
-    sceGuEnable(GU_BLEND);
-    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
-
-    if (appState == APP_SPLASH) {
-        ui_center(108, 3, 0xfff0e040, "MECANIC ENGINE GAMER");
-        ui_center(148, 2, 0xffffffff, "apresenta");
-        float a = (appT < 0.8f) ? 1.0f - appT / 0.8f : (appT > 2.2f ? (appT - 2.2f) / 0.8f : 0.0f);
-        if (a > 1.0f) a = 1.0f;
-        if (a > 0) rect2d(0, 0, 480, 272, ((unsigned int)(a * 255.0f) << 24));
-    } else if (appState == APP_TITLE) {
-        static const char *to[4] = { "Novo jogo", "Carregar jogo", "Creditos", "Sair" };
-        rect2d(0, 0, 480, 272, 0x70000000);
-        window(66, 6, 414, 124);
-        ui_center(14, 4, 0xff2020e0, "SOBREVIVENDO");
-        ui_center(50, 6, 0xff40e0ff, "EM GS");
-        ui_center(104, 2, 0xfff0e040, "MECANIC ENGINE GAMER");
-        window(130, 130, 350, 240);
-        for (int i = 0; i < 4; i++) {
-            int y = 140 + i * 24;
-            if (i == titleSel) rect2d(138, y - 3, 342, y + 17, 0xc0a06020);
-            sprintf(buf, "%s %s", i == titleSel ? ">" : " ", to[i]);
-            ui_text(146, y, 2, 0xffffffff, buf);
-        }
-        ui_center(254, 1, 0xffc0c0c0, "(c) MECANIC ENGINE GAMER - Sobrevivendo Em GS");
-    } else if (appState == APP_NEW) {
-        rect2d(0, 0, 480, 272, 0x80000000);
-        window(36, 20, 444, 252);
-        ui_center(28, 2, 0xff40e0ff, "== NOVO JOGO ==");
-        for (int i = 0; i < 6; i++) {
-            int y = 58 + i * 24;
-            if (i == nwSel) rect2d(46, y - 3, 434, y + 17, 0xc0a06020);
-            unsigned int col = (i == 4) ? 0xff60ff60 : 0xffffffff;
-            if (i == 0) sprintf(buf, "Slot: %d %s", nwSlot + 1, slotInfos[nwSlot].used ? "(sobrescrever!)" : "(vazio)");
-            else if (i == 1) sprintf(buf, "Sobrevivente: %s", survNames[nwName]);
-            else if (i == 2) { if (nwSeed) sprintf(buf, "Semente do mundo: %d", nwSeed); else strcpy(buf, "Semente do mundo: aleatoria"); }
-            else if (i == 3) sprintf(buf, "Dificuldade: %s", diffNames[nwDiff]);
-            else if (i == 4) strcpy(buf, "COMECAR A SOBREVIVER");
-            else strcpy(buf, "Voltar");
-            ui_text(56, y, 2, col, buf);
-        }
-        ui_text(46, 216, 1, 0xffc0c0c0, "Cima/Baixo escolhe   Esq/Dir muda   X confirma   O volta");
-        ui_text(46, 228, 1, 0xffc0c0c0, "A semente muda a posicao dos zumbis, arvores e saques.");
-    } else if (appState == APP_LOAD) {
-        rect2d(0, 0, 480, 272, 0x80000000);
-        window(36, 24, 444, 254);
-        ui_center(32, 2, 0xff40e0ff, "== CARREGAR JOGO ==");
-        for (int i = 0; i < 3; i++) {
-            int y = 62 + i * 50;
-            if (i == slotSel) rect2d(46, y - 4, 434, y + 36, 0xc0a06020);
-            if (slotInfos[i].used) {
-                sprintf(buf, "Slot %d: %s", i + 1, survNames[slotInfos[i].nameIdx]);
-                ui_text(56, y, 2, 0xffffffff, buf);
-                sprintf(buf, "Dia %d   Pecas de radio: %d/4   Abates: %d", slotInfos[i].day, slotInfos[i].parts, slotInfos[i].kills);
-                ui_text(56, y + 20, 1, 0xffc0ffc0, buf);
-            } else { sprintf(buf, "Slot %d: (vazio)", i + 1); ui_text(56, y, 2, 0xff909090, buf); }
-        }
-        if (menuMsg[0]) ui_text(46, 214, 2, 0xff60ff60, menuMsg);
-        ui_text(46, 238, 1, 0xffc0c0c0, "X: carregar     Quadrado: apagar     O: voltar");
-    } else if (appState == APP_CREDITS) {
-        rect2d(0, 0, 480, 272, 0xd8000000);
-        float y = creditsY;
-        for (int i = 0; i < NCRED; i++) {
-            if (CREDITS[i].t[0] && y > -40 && y < 280) ui_center((int)y, CREDITS[i].sc, CREDITS[i].col, CREDITS[i].t);
-            y += cred_h(&CREDITS[i]);
-        }
-        rect2d(0, 254, 480, 272, 0xe0000000);
-        ui_center(260, 1, 0xff909090, "START: pular    X: acelerar");
-    } else if (appState == APP_POST) {
-        float t = appT;
-        for (int i = 0; i < 8; i++) rect2d(0, i * 34, 480, i * 34 + 34, 0xff000000 | ((20 + i * 3) << 16) | ((10 + i) << 8) | 8);
-        if (t < 3.0f) ui_center(120, 2, 0xffffffff, "Algumas semanas depois...");
-        else if (t < 8.0f) {
-            ui_center(40, 2, 0xff40e0ff, "[RADIO] Aqui e a Central...");
-            ui_center(70, 1, 0xffffffff, "Captamos um novo sinal de socorro vindo de uma ilha distante.");
-            for (int i = 0; i < 24; i++) { int h = 6 + (int)(24.0f * fabsf(sinf(appT * 6.0f + i * 0.7f))); rect2d(120 + i * 10, 150 - h, 126 + i * 10, 150 + h, 0xff40e0ff); }
-            ui_center(200, 1, 0xffc0c0c0, "...repetindo: ha sobreviventes. Preciso de voluntarios.");
-        } else if (t < 12.0f) {
-            ui_center(40, 2, 0xffffffff, "O helicoptero decola de novo...");
-            draw_heli_art(-60 + (int)((t - 8.0f) * 140.0f), 130, ((int)(t * 4.0f)) & 1);
-        } else if (t < 14.0f) {
-            ui_center(120, 2, 0xffffffff, "A sobrevivencia continua...");
+    tex_bind(T_WALL, 1, 1);
+    for (i = 0; i < nv; i++) if (blds[visb[i]].kind == 0) bld_sides(&blds[visb[i]]);
+    tex_bind(T_WHITE, 0, 0);
+    for (i = 0; i < nv; i++) {
+        const Bld *b = &blds[visb[i]];
+        if (b->kind == 0) {
+            float p[12];
+            p[0] = b->x0; p[1] = b->h; p[2] = b->z0; p[3] = b->x1; p[4] = b->h; p[5] = b->z0;
+            p[6] = b->x1; p[7] = b->h; p[8] = b->z1; p[9] = b->x0; p[10] = b->h; p[11] = b->z1;
+            quad1(p, 0, 0, 1, 1, shade(b->col, 0.5f));
         } else {
-            ui_center(60, 3, 0xff40e0ff, "SOBREVIVENDO EM GS 2");
-            ui_center(110, 4, 0xfff0e040, "EM BREVE");
-            ui_center(170, 2, 0xffffffff, "MECANIC ENGINE GAMER");
-            if (((int)(appT * 2.0f)) & 1) ui_center(230, 2, 0xffc0c0c0, creditsFromGame ? "X: voltar ao jogo" : "X: voltar ao menu");
-        }
-        ui_center(260, 1, 0xff707070, "START: pular");
-    }
-
-    sceGuDisable(GU_BLEND);
-    sceGuEnable(GU_DEPTH_TEST);
-}
-
-static void app_update(float dt, unsigned int pressed, unsigned int held) {
-    appT += dt;
-    if (appState != APP_SPLASH && appState != APP_POST) cam += dt * 0.12f;
-    if (appState == APP_SPLASH) {
-        if (appT > 3.0f || (pressed & (PSP_CTRL_START | PSP_CTRL_CROSS))) { appState = APP_TITLE; titleSel = 0; appT = 0; }
-    } else if (appState == APP_TITLE) {
-        if (pressed & PSP_CTRL_UP)   { titleSel = (titleSel + 3) % 4; play_sfx(5); }
-        if (pressed & PSP_CTRL_DOWN) { titleSel = (titleSel + 1) % 4; play_sfx(5); }
-        if (pressed & PSP_CTRL_CROSS) {
-            play_sfx(5);
-            if (titleSel == 0) {
-                refresh_slots(); nwSel = 0; nwName = 0; nwSeed = 0; nwDiff = 1; nwSlot = 0;
-                for (int i = 2; i >= 0; i--) if (!slotInfos[i].used) nwSlot = i;
-                menuMsg[0] = 0; appState = APP_NEW;
-            } else if (titleSel == 1) { refresh_slots(); slotSel = 0; delConfirm = -1; menuMsg[0] = 0; appState = APP_LOAD; }
-            else if (titleSel == 2) { creditsFromGame = 0; creditsY = 272.0f; appT = 0; appState = APP_CREDITS; }
-            else running = 0;
-        }
-    } else if (appState == APP_NEW) {
-        if (pressed & PSP_CTRL_UP)   { nwSel = (nwSel + 5) % 6; play_sfx(5); }
-        if (pressed & PSP_CTRL_DOWN) { nwSel = (nwSel + 1) % 6; play_sfx(5); }
-        int d = 0;
-        if (pressed & PSP_CTRL_LEFT) d = -1;
-        if (pressed & PSP_CTRL_RIGHT) d = 1;
-        if (d) {
-            play_sfx(5);
-            if (nwSel == 0) nwSlot = (nwSlot + 3 + d) % 3;
-            else if (nwSel == 1) nwName = (nwName + 8 + d) % 8;
-            else if (nwSel == 2) { nwSeed += d; if (nwSeed < 0) nwSeed = 99; if (nwSeed > 99) nwSeed = 0; }
-            else if (nwSel == 3) nwDiff = (nwDiff + 3 + d) % 3;
-        }
-        if ((pressed & PSP_CTRL_LTRIGGER) && nwSel == 2) nwSeed = (nwSeed + 90) % 100;
-        if ((pressed & PSP_CTRL_RTRIGGER) && nwSel == 2) nwSeed = (nwSeed + 10) % 100;
-        if (pressed & PSP_CTRL_CIRCLE) appState = APP_TITLE;
-        if (pressed & PSP_CTRL_CROSS) {
-            if (nwSel == 4) { create_world(); appState = APP_PLAY; mode = 0; say("Sobreviva! Ache 4 pecas de radio."); play_sfx(4); }
-            else if (nwSel == 5) appState = APP_TITLE;
-        }
-    } else if (appState == APP_LOAD) {
-        if (pressed & PSP_CTRL_UP)   { slotSel = (slotSel + 2) % 3; delConfirm = -1; menuMsg[0] = 0; play_sfx(5); }
-        if (pressed & PSP_CTRL_DOWN) { slotSel = (slotSel + 1) % 3; delConfirm = -1; menuMsg[0] = 0; play_sfx(5); }
-        if (pressed & PSP_CTRL_CIRCLE) appState = APP_TITLE;
-        if (pressed & PSP_CTRL_SQUARE) {
-            if (!slotInfos[slotSel].used) { strcpy(menuMsg, "Slot vazio."); play_sfx(10); }
-            else if (delConfirm == slotSel) {
-                char pth[96]; slot_path(slotSel, pth); sceIoRemove(pth);
-                refresh_slots(); delConfirm = -1; strcpy(menuMsg, "Slot apagado."); play_sfx(4);
-            } else { delConfirm = slotSel; strcpy(menuMsg, "Quadrado de novo para apagar!"); play_sfx(10); }
-        }
-        if (pressed & PSP_CTRL_CROSS) {
-            if (!slotInfos[slotSel].used) { strcpy(menuMsg, "Slot vazio."); play_sfx(10); }
-            else {
-                curSlot = slotSel;
-                if (load_game()) { appState = APP_PLAY; mode = 0; say("Jogo carregado!"); play_sfx(4); }
-                else { strcpy(menuMsg, "Erro ao carregar!"); play_sfx(10); }
-            }
-        }
-    } else if (appState == APP_CREDITS) {
-        float sp = 28.0f + ((held & PSP_CTRL_CROSS) ? 70.0f : 0.0f);
-        creditsY -= sp * dt;
-        if (creditsY + credits_height() < 0 || (pressed & PSP_CTRL_START)) { appState = APP_POST; appT = 0; }
-        else if ((pressed & PSP_CTRL_CIRCLE) && !creditsFromGame) appState = APP_TITLE;
-    } else if (appState == APP_POST) {
-        if ((pressed & PSP_CTRL_START) || (appT > 14.0f && (pressed & PSP_CTRL_CROSS))) {
-            if (creditsFromGame) { appState = APP_PLAY; mode = 0; say("Voce escapou! Continue sobrevivendo."); }
-            else { appState = APP_TITLE; titleSel = 0; }
+            box((b->x0 + b->x1) * 0.5f, 0, (b->z0 + b->z1) * 0.5f, b->x1 - b->x0, b->h, b->z1 - b->z0, 0, b->col);
         }
     }
+    /* arvores */
+    for (i = 0; i < ntree; i++) {
+        const Tree *t = &trees[i];
+        if (dist2(t->x, t->z, cam_x, cam_z) > 120.0f * 120.0f || !visible(t->x, t->z, 3)) continue;
+        box(t->x, 0, t->z, 0.35f, 2.2f * t->s, 0.35f, 0, RGB(90, 62, 40));
+        box(t->x, 1.8f * t->s, t->z, 2.2f * t->s, 2.6f * t->s, 2.2f * t->s, (float)i, t->col);
+    }
+    /* muros do limite do mapa */
+    box(0, 0, -WORLD_HALF - 25, 900, 6, 4, 0, RGB(70, 70, 76));
+    box(0, 0,  WORLD_HALF + 25, 900, 6, 4, 0, RGB(70, 70, 76));
+    box(-WORLD_HALF - 25, 0, 0, 4, 6, 900, 0, RGB(70, 70, 76));
+    box( WORLD_HALF + 25, 0, 0, 4, 6, 900, 0, RGB(70, 70, 76));
+    /* zumbis */
+    for (i = 0; i < MAX_ZOMBIES; i++) {
+        const Zombie *z = &Z[i];
+        Style st;
+        static const unsigned int shirts[5] = {RGB(90, 70, 60), RGB(60, 80, 100), RGB(100, 100, 70), RGB(80, 60, 90), RGB(110, 50, 50)};
+        if (!z->alive || dist2(z->x, z->z, cam_x, cam_z) > 140.0f * 140.0f || !visible(z->x, z->z, 2)) continue;
+        st.shirt = shirts[i % 5]; st.pants = RGB(50, 50, 66); st.zombie = 1;
+        st.skin = z->type == 1 ? RGB(150, 165, 120) : (z->type == 2 ? RGB(95, 120, 85) : RGB(120, 150, 100));
+        st.wf = z->type == 2 ? 1.4f : (z->type == 1 ? 0.92f : 1.0f);
+        st.hf = z->type == 2 ? 1.2f : 1.0f;
+        person(z->x, z->z, z->yaw, z->anim, z->hp <= 0 ? fmaxf(0.1f, 1.0f - z->deadt * 2.0f) : 1.0f, &st, z->hurt > 0);
+    }
+    /* sobreviventes */
+    for (i = 0; i < nsurv; i++) {
+        const Survivor *s = &S[i];
+        Style st;
+        if (s->state == 2 || s->inside || dist2(s->x, s->z, cam_x, cam_z) > 140.0f * 140.0f || !visible(s->x, s->z, 2)) continue;
+        st.shirt = s->shirt; st.pants = RGB(60, 70, 90); st.skin = RGB(205, 160, 125); st.wf = 1; st.hf = 1; st.zombie = 0;
+        person(s->x, s->z, s->yaw, s->state == 1 ? s->anim : 0.0f, 1.0f, &st, 0);
+        marker(s->x, s->z, 2.1f, s->state == 0 ? RGB(255, 210, 40) : RGB(60, 230, 90));
+        if (s->flash > 0) box(s->x - sinf(s->yaw) * 0.9f, 1.15f, s->z - cosf(s->yaw) * 0.9f, 0.18f, 0.18f, 0.18f, 0, RGB(255, 240, 120));
+    }
+    /* jogadores remotos (multiplayer / loopback) */
+    for (i = 0; i < NET_MAX; i++)
+        if (RP[i].active && visible(RP[i].x, RP[i].z, 2)) {
+            Style st;
+            st.shirt = RGB(230, 120, 30); st.pants = RGB(40, 40, 50); st.skin = RGB(205, 160, 125); st.wf = 1; st.hf = 1; st.zombie = 0;
+            if (!RP[i].in_car) { person(RP[i].x, RP[i].z, RP[i].yaw, RP[i].anim, 1.0f, &st, 0); marker(RP[i].x, RP[i].z, 2.1f, RGB(255, 120, 30)); }
+        }
+    /* carros (sprites) */
+    sceGuEnable(GU_ALPHA_TEST);
+    sceGuAlphaFunc(GU_GREATER, 0, 0xff);
+    for (i = 0; i < MAX_CARS; i++) {
+        const Car *c = &C[i];
+        if (c->hp == 0.0f || P.in_car == i || dist2(c->x, c->z, cam_x, cam_z) > 190.0f * 190.0f || !visible(c->x, c->z, 4)) continue;
+        car_bb(c->x, c->z, c->type, c->yaw, c->state == 2 ? RGB(80, 80, 80) : RGB(255, 255, 255));
+    }
+    for (i = 0; i < NET_MAX; i++)
+        if (RP[i].active && RP[i].in_car && visible(RP[i].x, RP[i].z, 4)) car_bb(RP[i].x, RP[i].z, RP[i].car_type, RP[i].yaw, RGB(255, 255, 255));
+    sceGuDisable(GU_ALPHA_TEST);
 }
 
-int main(void) {
-    setup_callbacks();
-    sceCtrlSetSamplingCycle(0);
-    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
+/* arma em primeira pessoa (espaco de camera) */
+static void draw_viewmodel(void)
+{
+    float bobx = sinf(P.bob) * 0.012f * (P.speed > 0.5f ? 1.0f : 0.15f);
+    float boby = fabsf(cosf(P.bob)) * 0.010f * (P.speed > 0.5f ? 1.0f : 0.15f);
+    float kick = P.recoil * 0.9f + (P.flash > 0 ? 0.03f : 0.0f);
+    float ax = lerpf(0.20f, 0.0f, P.aim) + bobx, ay = lerpf(-0.24f, -0.17f, P.aim) - boby, az = -0.55f + kick;
+    unsigned int steel = RGB(55, 58, 64), dark = RGB(28, 28, 32), wood = RGB(110, 70, 38), skin = RGB(205, 160, 125), sleeve = RGB(60, 90, 70);
+    float reload_dip = P.reloading ? 0.10f : 0.0f;
+    ay -= reload_dip;
+    g_cs = 1;
+    sceGuClearDepth(0);
+    sceGuClear(GU_DEPTH_BUFFER_BIT);
+    sceGuDisable(GU_FOG);
+    tex_bind(T_WHITE, 0, 0);
+    switch (P.weapon) {
+    case 0:
+        box(ax, ay + 0.00f, az - 0.12f, 0.05f, 0.06f, 0.26f, 0, steel);
+        box(ax, ay - 0.11f, az - 0.02f, 0.045f, 0.12f, 0.07f, 0, dark);
+        box(ax, ay - 0.15f, az + 0.02f, 0.07f, 0.07f, 0.09f, 0, skin);
+        box(ax + 0.02f, ay - 0.30f, az + 0.25f, 0.10f, 0.10f, 0.50f, 0, sleeve);
+        break;
+    case 1:
+        box(ax, ay + 0.02f, az - 0.35f, 0.045f, 0.045f, 0.62f, 0, steel);
+        box(ax, ay - 0.025f, az - 0.20f - (P.flash > 0 ? 0.0f : 0.04f), 0.07f, 0.05f, 0.20f, 0, wood);
+        box(ax, ay - 0.04f, az + 0.10f, 0.06f, 0.10f, 0.28f, 0, wood);
+        box(ax - 0.01f, ay - 0.08f, az - 0.20f, 0.08f, 0.06f, 0.10f, 0, skin);
+        box(ax + 0.02f, ay - 0.30f, az + 0.30f, 0.10f, 0.10f, 0.50f, 0, sleeve);
+        break;
+    default:
+        box(ax, ay + 0.00f, az - 0.20f, 0.06f, 0.09f, 0.60f, 0, steel);
+        box(ax, ay + 0.03f, az - 0.62f, 0.03f, 0.03f, 0.30f, 0, dark);
+        box(ax, ay - 0.14f, az - 0.10f, 0.04f, 0.15f, 0.07f, 0, dark);
+        box(ax, ay + 0.09f, az - 0.15f, 0.04f, 0.05f, 0.18f, 0, dark);
+        box(ax, ay - 0.02f, az + 0.25f, 0.06f, 0.10f, 0.28f, 0, wood);
+        box(ax - 0.01f, ay - 0.07f, az - 0.28f, 0.08f, 0.06f, 0.10f, 0, skin);
+        box(ax + 0.02f, ay - 0.30f, az + 0.40f, 0.10f, 0.10f, 0.50f, 0, sleeve);
+        break;
+    }
+    if (P.flash > 0) {
+        float tip = P.weapon == 0 ? -0.28f : (P.weapon == 1 ? -0.68f : -0.80f);
+        box(ax, ay + 0.005f, az + tip, 0.07f, 0.07f, 0.12f, 0, RGB(255, 235, 120));
+        box(ax, ay + 0.015f, az + tip - 0.08f, 0.03f, 0.03f, 0.08f, 0, RGB(255, 255, 220));
+    }
+    g_cs = 0;
+}
 
-    build_cube();
-    build_ground();
-    reset_state();
-    seed_rng = seed_for(0);
-    init_world();
+static void draw_crosshair(void)
+{
+    float cx = SCR_W * 0.5f, cy = SCR_H * 0.5f;
+    float gap = (float)CROSS_GAP[P.weapon] + P.bloom * 14.0f + (P.speed > 0.5f ? 4.0f : 0.0f);
+    unsigned int col = G.aim_hit ? RGBA(255, 50, 40, 255) : RGBA(255, 255, 255, 230);
+    unsigned int sh = RGBA(0, 0, 0, 160);
+    float len = P.weapon == 1 ? 6.0f : 7.0f;
+    if (P.aim > 0.5f) gap *= 0.5f;
+    if (P.reloading) col = RGBA(255, 200, 40, 230);
+    /* sombra */
+    rect(cx - gap - len + 1, cy - 0.5f + 1, len, 2, sh); rect(cx + gap + 1, cy - 0.5f + 1, len, 2, sh);
+    rect(cx - 0.5f + 1, cy - gap - len + 1, 2, len, sh); rect(cx - 0.5f + 1, cy + gap + 1, 2, len, sh);
+    rect(cx - gap - len, cy - 0.5f, len, 2, col); rect(cx + gap, cy - 0.5f, len, 2, col);
+    if (P.weapon != 2) rect(cx - 0.5f, cy - gap - len, 2, len, col);
+    rect(cx - 0.5f, cy + gap, 2, len, col);
+    rect(cx - 1, cy - 1, 2, 2, col);
+    if (P.weapon == 1) { /* espingarda: cantos do circulo de dispersao */
+        float g2 = gap + len + 4.0f;
+        rect(cx - g2, cy - g2, 4, 2, col); rect(cx - g2, cy - g2, 2, 4, col);
+        rect(cx + g2 - 4, cy - g2, 4, 2, col); rect(cx + g2 - 2, cy - g2, 2, 4, col);
+        rect(cx - g2, cy + g2 - 2, 4, 2, col); rect(cx - g2, cy + g2 - 4, 2, 4, col);
+        rect(cx + g2 - 4, cy + g2 - 2, 4, 2, col); rect(cx + g2 - 2, cy + g2 - 4, 2, 4, col);
+    }
+    if (P.hitmark > 0) { /* marcador de acerto */
+        unsigned int hm = RGBA(255, 60, 40, 255);
+        int k;
+        for (k = 4; k < 10; k += 2) {
+            rect(cx - k - 1, cy - k - 1, 2, 2, hm); rect(cx + k - 1, cy - k - 1, 2, 2, hm);
+            rect(cx - k - 1, cy + k - 1, 2, 2, hm); rect(cx + k - 1, cy + k - 1, 2, 2, hm);
+        }
+    }
+}
 
-    int at = sceKernelCreateThread("audio", audio_thread, 0x12, 0x10000, PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU, NULL);
-    if (at >= 0) sceKernelStartThread(at, 0, NULL);
+static void draw_radar(void)
+{
+    float cx = 436.0f, cy = 50.0f, R = 38.0f, sc = R / 70.0f;
+    int i;
+    rect(cx - R - 2, cy - R - 2, R * 2 + 4, R * 2 + 4, RGBA(0, 0, 0, 150));
+    rect(cx - R, cy - R, R * 2, R * 2, RGBA(30, 40, 30, 150));
+    rect(cx - R, cy - 0.5f, R * 2, 1, RGBA(90, 110, 90, 120));
+    rect(cx - 0.5f, cy - R, 1, R * 2, RGBA(90, 110, 90, 120));
+#define RDOT(wx, wz, col, sz)                                                                 \
+    do {                                                                                      \
+        float ddx = (wx) - P.x, ddz = (wz) - P.z;                                             \
+        float rr = ddx * cam_cs - ddz * cam_sn, ff = -ddx * cam_sn - ddz * cam_cs;            \
+        float px_ = cx + rr * sc, py_ = cy - ff * sc;                                         \
+        if (fabsf(px_ - cx) < R - 1 && fabsf(py_ - cy) < R - 1) rect(px_ - (sz) * 0.5f, py_ - (sz) * 0.5f, (sz), (sz), (col)); \
+    } while (0)
+    for (i = 0; i < MAX_CARS; i++) if (C[i].hp > 0) RDOT(C[i].x, C[i].z, RGBA(240, 200, 40, 255), 3.0f);
+    for (i = 0; i < nsurv; i++) if (S[i].state < 2 && !S[i].inside) RDOT(S[i].x, S[i].z, S[i].state == 0 ? RGBA(70, 160, 255, 255) : RGBA(70, 255, 110, 255), 3.0f);
+    for (i = 0; i < MAX_ZOMBIES; i++) if (Z[i].alive && Z[i].hp > 0) RDOT(Z[i].x, Z[i].z, RGBA(255, 50, 50, 255), 2.0f);
+#undef RDOT
+    rect(cx - 2, cy - 2, 4, 4, RGBA(255, 255, 255, 255));
+    rect(cx - 1, cy - 6, 2, 3, RGBA(255, 255, 255, 255));
+}
 
+static void draw_hud(void)
+{
+    const WeaponDef *w = &WEAP[P.weapon];
+    int i;
+    begin2d();
+    if (P.dmg_flash > 0) rect(0, 0, SCR_W, SCR_H, RGBA(200, 0, 0, (int)(P.dmg_flash * 170)));
+    if (P.in_car < 0) draw_crosshair();
+    /* barras */
+    rect(8, 238, 104, 12, RGBA(0, 0, 0, 150));
+    rect(10, 240, P.hp, 8, P.hp > 35 ? RGBA(210, 40, 40, 230) : RGBA(255, 60, 20, 255));
+    rect(8, 254, 104, 8, RGBA(0, 0, 0, 150));
+    rect(10, 256, P.stamina, 4, RGBA(230, 200, 50, 220));
+    if (P.in_car >= 0) {
+        const Car *c = &C[P.in_car];
+        float hpn = clampf(c->hp / (float)CARS[c->type].hp, 0, 1);
+        rect(0, 226, SCR_W, 46, RGBA(30, 30, 34, 235));
+        rect(0, 224, SCR_W, 3, RGBA(90, 90, 96, 255));
+        for (i = 0; i < 12; i++) { /* volante */
+            float a = i * (2 * PI / 12.0f);
+            rect(240 + cosf(a) * 30 - 3, 276 + sinf(a) * 24 - 3, 7, 7, RGBA(15, 15, 18, 255));
+        }
+        rect(236, 262, 8, 10, RGBA(60, 60, 70, 255));
+        spr2d(T_CAR + c->type, 330, 214, 128, 64, 0, RGBA(255, 255, 255, 255));
+        begin2d();
+        rect(330, 262, 100, 5, RGBA(0, 0, 0, 160));
+        rect(330, 262, 100 * hpn, 5, hpn > 0.35f ? RGBA(70, 200, 90, 255) : RGBA(230, 60, 40, 255));
+        text(130, 240, 0xFFFFFFFF, "%3d KM/H", (int)(fabsf(c->speed) * 3.6f));
+        text(130, 252, 0xFFB0B0B0, "%s", CARS[c->type].name);
+    } else {
+        rect(366, 238, 108, 28, RGBA(0, 0, 0, 140));
+        text(370, 240, 0xFFFFFFFF, "%s", w->name);
+        text(370, 252, P.reloading ? 0xFF40E0FF : 0xFFFFFFFF, "%2d / %3d", P.mag[P.weapon], P.reserve[P.weapon]);
+    }
+    draw_radar();
+    rect(4, 4, 150, 38, RGBA(0, 0, 0, 130));
+    text(8, 6, 0xFF60FF60, "$ %d", sv.money);
+    text(8, 16, 0xFFFFFFFF, "ONDA %d   MORTES %d", G.wave, G.kills);
+    text(8, 26, 0xFFFFE060, "GRUPO %d/%d  KIT %d", count_follow(), MAX_FOLLOW, P.medkits);
+    if (G.msg_t > 0) textc(60, 0xFF40E0FF, "%s", G.msg);
+    if (G.prompt_kind == 1) textc(190, 0xFF60FF60, "[TRIANGULO] Recrutar %s", SURV_NAMES[S[G.prompt_idx].name]);
+    if (G.prompt_kind == 2) textc(190, 0xFF40E0FF, "[TRIANGULO] Entrar: %s", CARS[C[G.prompt_idx].type].name);
+    if (P.in_car >= 0) textc(206, 0xFFB0B0B0, "TRIANGULO sai do carro");
+    if (P.reloading) textc(150, 0xFF40E0FF, "RECARREGANDO...");
+    if (net.mode == 1) text(8, 44, 0xFFFFA040, "MP: loopback ativo");
+}
+
+static void draw_play(void)
+{
+    float eye, yaw, pitch, fov;
+    float horizon, f;
+    if (P.in_car >= 0) {
+        const Car *c = &C[P.in_car];
+        eye = 1.35f + sinf(G.time * 40.0f) * 0.004f * fabsf(c->speed);
+        yaw = c->yaw; pitch = P.pitch;
+        P.fov = lerpf(P.fov, 76.0f + fabsf(c->speed) * 0.25f, 0.1f);
+    } else {
+        eye = 1.65f + fabsf(cosf(P.bob)) * 0.05f * (P.speed > 0.5f ? 1.0f : 0.0f);
+        yaw = P.yaw; pitch = P.pitch + P.recoil;
+        P.fov = lerpf(P.fov, P.aim > 0.5f ? 50.0f : 68.0f, 0.2f);
+    }
+    if (P.dmg_flash > 0.2f) { yaw += frange(-0.01f, 0.01f); pitch += frange(-0.01f, 0.01f); }
+    fov = P.fov;
+    cam_set(P.x, eye, P.z, yaw, pitch);
+    /* ceu */
+    f = (SCR_H * 0.5f) / tanf(fov * PI / 360.0f);
+    horizon = clampf(SCR_H * 0.5f + f * tanf(pitch), 0, SCR_H);
+    begin2d();
+    gradient(0, horizon > 1 ? horizon : 1, RGB(38, 48, 70), FOG_COL);
+    if (horizon < SCR_H) rect(0, horizon, SCR_W, SCR_H - horizon, FOG_COL);
+    begin3d(fov);
+    draw_world();
+    if (P.in_car < 0) draw_viewmodel();
+    draw_hud();
+}
+
+/*------------------------------ menus -------------------------------*/
+enum { ST_MENU, ST_SHOP, ST_LOBBY, ST_PLAY, ST_PAUSE, ST_DEAD };
+static int state = ST_MENU;
+static int menu_sel = 0, shop_tab = 0, shop_sel[3] = {0, 0, 0}, lobby_loop = 0, pause_sel = 0;
+static float menu_t = 0;
+static int running = 1;
+
+static void bg_menu(void)
+{
+    begin2d();
+    gradient(0, SCR_H, RGB(16, 18, 24), RGB(48, 28, 28));
+    rect(0, 0, SCR_W, 3, RGBA(150, 20, 20, 255));
+    rect(0, SCR_H - 3, SCR_W, 3, RGBA(150, 20, 20, 255));
+}
+
+static void draw_menu(void)
+{
+    static const char *items[4] = {"JOGAR", "LOJA", "MULTIPLAYER", "SAIR"};
+    int i, car = (int)(menu_t / 2.5f) % CAR_COUNT;
+    const char *t1 = "SOBREVIVENDO", *t2 = "EM GS";
+    bg_menu();
+    big_text((SCR_W - big_w(t1, 6)) / 2, 14, 6, RGBA(225, 225, 225, 255), t1);
+    big_text((SCR_W - big_w(t2, 8)) / 2, 54, 8, RGBA(200, 30, 30, 255), t2);
+    spr2d(T_CAR + car, 250, 110, 224, 112, 0, RGBA(255, 255, 255, 255));
+    begin2d();
+    textc(222, 0xFFB0B0B0, "%s", CARS[car].name);
+    for (i = 0; i < 4; i++) {
+        text(48, 120 + i * 24, i == menu_sel ? 0xFF40E0FF : 0xFFB0B0B0, "%s %s", i == menu_sel ? ">" : " ", items[i]);
+    }
+    text(8, 254, 0xFF60FF60, "$ %d   Melhor onda: %d   Mortes: %d", sv.money, sv.best_wave, sv.best_kills);
+    text(8, 262, 0xFF909090, "Cima/Baixo = escolher   X = confirmar");
+}
+
+static int shop_count(int tab) { return tab == 0 ? 3 : (tab == 1 ? 4 : CAR_COUNT); }
+
+static void shop_buy(void)
+{
+    int sel = shop_sel[shop_tab];
+    if (shop_tab == 0) {
+        static const int price[3] = {0, 1500, 3500};
+        if (sv.wown[sel]) { say("Voce ja tem %s", WEAP[sel].name); return; }
+        if (sv.money < price[sel]) { say("Dinheiro insuficiente"); return; }
+        sv.money -= price[sel]; sv.wown[sel] = 1; sv.total[sel] += WEAP[sel].mag; say("Comprou %s!", WEAP[sel].name);
+    } else if (shop_tab == 1) {
+        static const int price[4] = {120, 200, 300, 150};
+        if (sv.money < price[sel]) { say("Dinheiro insuficiente"); return; }
+        if (sel == 3 && sv.medkits >= 5) { say("Maximo de 5 kits"); return; }
+        sv.money -= price[sel];
+        if (sel == 0) sv.total[0] += 36;
+        else if (sel == 1) sv.total[1] += 16;
+        else if (sel == 2) sv.total[2] += 60;
+        else sv.medkits++;
+        say("Compra realizada!");
+    } else {
+        if (sv.cown[sel]) { sv.selcar = sel; say("%s selecionado", CARS[sel].name); }
+        else if (sv.money < CARS[sel].price) say("Dinheiro insuficiente");
+        else { sv.money -= CARS[sel].price; sv.cown[sel] = 1; sv.selcar = sel; say("Comprou %s!", CARS[sel].name); }
+    }
+    save_write();
+}
+
+static void draw_shop(void)
+{
+    static const char *tabs[3] = {"ARMAS", "ITENS", "CARROS"};
+    static const char *wn[3] = {"Pistola", "Espingarda", "Rifle"};
+    static const int wp[3] = {0, 1500, 3500};
+    static const char *in_[4] = {"Municao 9mm  x36", "Cartuchos     x16", "Municao rifle x60", "Kit medico     x1"};
+    static const int ip[4] = {120, 200, 300, 150};
+    int i, n = shop_count(shop_tab), sel = shop_sel[shop_tab], first = 0;
+    bg_menu();
+    big_text(16, 10, 5, RGBA(225, 225, 225, 255), "LOJA");
+    text(300, 12, 0xFF60FF60, "$ %d", sv.money);
+    for (i = 0; i < 3; i++) text(16 + i * 96, 44, i == shop_tab ? 0xFF40E0FF : 0xFF909090, "%s%s%s", i == shop_tab ? "[" : " ", tabs[i], i == shop_tab ? "]" : " ");
+    text(16, 56, 0xFF707070, "L/R muda de aba");
+    if (sel > 8) first = sel - 8;
+    for (i = first; i < n && i < first + 9; i++) {
+        int y = 72 + (i - first) * 16;
+        unsigned int col = i == sel ? 0xFF40E0FF : 0xFFC0C0C0;
+        if (shop_tab == 0)
+            text(16, y, col, "%s %-11s %s", i == sel ? ">" : " ", wn[i], sv.wown[i] ? "COMPRADO" : "");
+        else if (shop_tab == 1)
+            text(16, y, col, "%s %s", i == sel ? ">" : " ", in_[i]);
+        else
+            text(16, y, col, "%s %-20s%s", i == sel ? ">" : " ", CARS[i].name, sv.selcar == i ? "*" : (sv.cown[i] ? "+" : " "));
+    }
+    if (shop_tab == 0) {
+        text(16, 224, 0xFFB0B0B0, "Preco: %s", wp[sel] ? "" : "inicial");
+        if (wp[sel]) text(16 + 7 * 8, 224, 0xFF60FF60, "$%d", wp[sel]);
+        text(260, 80, 0xFFB0B0B0, "DANO %d x%d", (int)WEAP[sel].dmg, WEAP[sel].pellets);
+        text(260, 92, 0xFFB0B0B0, "CARREGADOR %d", WEAP[sel].mag);
+        text(260, 104, 0xFFB0B0B0, "TIRO %s", WEAP[sel].automatic ? "AUTOMATICO" : "SIMPLES");
+        text(260, 116, 0xFFB0B0B0, "ALCANCE %dm", (int)WEAP[sel].range);
+    } else if (shop_tab == 1) {
+        text(16, 224, 0xFFB0B0B0, "Preco:");
+        text(16 + 7 * 8, 224, 0xFF60FF60, "$%d", ip[sel]);
+        text(260, 80, 0xFFB0B0B0, "Estoque 9mm ..... %d", sv.total[0]);
+        text(260, 92, 0xFFB0B0B0, "Estoque cartucho. %d", sv.total[1]);
+        text(260, 104, 0xFFB0B0B0, "Estoque rifle ... %d", sv.total[2]);
+        text(260, 116, 0xFFB0B0B0, "Kits medicos .... %d/5", sv.medkits);
+    } else {
+        spr2d(T_CAR + sel, 250, 56, 224, 112, 0, RGBA(255, 255, 255, 255));
+        begin2d();
+        text(260, 176, 0xFFFFFFFF, "%s", CARS[sel].name);
+        text(260, 188, 0xFFB0B0B0, "VEL %d KM/H   VIDA %d", (int)(CARS[sel].vmax * 3.6f), CARS[sel].hp);
+        if (sv.selcar == sel) text(260, 200, 0xFF40E0FF, "SELECIONADO");
+        else if (sv.cown[sel]) text(260, 200, 0xFF60FF60, "COMPRADO - X seleciona");
+        else text(260, 200, 0xFF60FF60, "PRECO $%d", CARS[sel].price);
+    }
+    if (G.msg_t > 0) textc(236, 0xFF40E0FF, "%s", G.msg);
+    text(8, 262, 0xFF909090, "X = comprar/equipar   O = voltar   (mais itens em breve)");
+}
+
+static void draw_lobby(void)
+{
+    int i;
+    bg_menu();
+    big_text(16, 10, 5, RGBA(225, 225, 225, 255), "MULTIPLAYER");
+    text(16, 52, 0xFFFFA040, "Wi-Fi local (Ad-Hoc) ate 4 jogadores: EM BREVE");
+    text(16, 64, 0xFF909090, "Protocolo v%d - pacotes de %d bytes a 20 Hz", NET_VERSION, (int)sizeof(NetPacket));
+    for (i = 0; i < NET_MAX; i++) {
+        int y = 96 + i * 18;
+        if (i == 0) text(32, y, 0xFF60FF60, "Slot 1: VOCE (host)");
+        else if (i == 1 && lobby_loop) text(32, y, 0xFFFFA040, "Slot 2: JOGADOR-FANTASMA (loopback)");
+        else text(32, y, 0xFF707070, "Slot %d: aguardando...", i + 1);
+    }
+    text(32, 180, lobby_loop ? 0xFF40E0FF : 0xFFB0B0B0, "[Quadrado] Teste loopback: %s", lobby_loop ? "LIGADO" : "DESLIGADO");
+    text(32, 200, 0xFFFFFFFF, "[X] Iniciar jogo   [O] Voltar");
+}
+
+static void end_run(void)
+{
+    int i;
+    for (i = 0; i < 3; i++) sv.total[i] = P.reserve[i] + P.mag[i];
+    sv.medkits = P.medkits;
+    if (G.wave > sv.best_wave) sv.best_wave = G.wave;
+    if (G.kills > sv.best_kills) sv.best_kills = G.kills;
+    save_write();
+}
+
+static void game_start(void)
+{
+    int i;
+    memset(&P, 0, sizeof(P));
+    memset(&G, 0, sizeof(G));
+    memset(RP, 0, sizeof(RP));
+    memset(&net, 0, sizeof(net));
+    net.mode = lobby_loop ? 1 : 0;
+    world_gen_entities();
+    P.x = 50.0f; P.z = 53.0f; P.yaw = -PI / 2; P.hp = 100; P.stamina = 100; P.in_car = -1; P.fov = 68.0f;
+    for (i = 0; i < 3; i++) {
+        int total = sv.total[i], m;
+        if (i == 0 && total < 48) total = 48;
+        m = total < WEAP[i].mag ? total : WEAP[i].mag;
+        P.mag[i] = m; P.reserve[i] = total - m;
+    }
+    P.medkits = sv.medkits;
+    G.wave = 1; G.spawn_t = 2.0f;
+    say("Sobreviva! Seu carro esta ao lado.");
+}
+
+static void draw_overlay_text(const char *big, unsigned int col, int sc)
+{
+    begin2d();
+    rect(0, 0, SCR_W, SCR_H, RGBA(0, 0, 0, 150));
+    big_text((SCR_W - big_w(big, sc)) / 2, 50, sc, col, big);
+}
+
+/*------------------------------ main --------------------------------*/
+static void gfx_init(void)
+{
+    pspDebugScreenInit();
+    pspDebugScreenEnableBackColor(0);
     sceGuInit();
-    sceGuStart(GU_DIRECT, list);
+    sceGuStart(GU_DIRECT, dlist);
     sceGuDrawBuffer(GU_PSM_8888, (void *)0, BUF_W);
-    sceGuDispBuffer(SCR_W, SCR_H, (void *)FRAME, BUF_W);
-    sceGuDepthBuffer((void *)(FRAME * 2), BUF_W);
+    sceGuDispBuffer(SCR_W, SCR_H, (void *)FRAME_SIZE, BUF_W);
+    sceGuDepthBuffer((void *)(FRAME_SIZE * 2), BUF_W);
     sceGuOffset(2048 - (SCR_W / 2), 2048 - (SCR_H / 2));
     sceGuViewport(2048, 2048, SCR_W, SCR_H);
     sceGuDepthRange(65535, 0);
@@ -1839,49 +1757,120 @@ int main(void) {
     sceGuEnable(GU_SCISSOR_TEST);
     sceGuDepthFunc(GU_GEQUAL);
     sceGuEnable(GU_DEPTH_TEST);
+    sceGuDisable(GU_CULL_FACE);
     sceGuShadeModel(GU_SMOOTH);
     sceGuEnable(GU_CLIP_PLANES);
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexScale(1.0f, 1.0f);
+    sceGuTexOffset(0.0f, 0.0f);
     sceGuFinish();
     sceGuSync(0, 0);
     sceDisplayWaitVblankStart();
     sceGuDisplay(GU_TRUE);
+}
 
-    SceCtrlData pad; memset(&pad, 0, sizeof(pad));
-    unsigned int oldButtons = 0;
-    unsigned int last = sceKernelGetSystemTimeLow();
+static void frame_begin(void)
+{
+    sceGuStart(GU_DIRECT, dlist);
+    sceGuClearColor(FOG_COL);
+    sceGuClearDepth(0);
+    sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT | GU_FAST_CLEAR_BIT);
+}
+
+static void frame_end(void)
+{
+    sceGuFinish();
+    sceGuSync(0, 0);
+    text_flush();
+    sceDisplayWaitVblankStart();
+    sceGuSwapBuffers();
+    draw_off = draw_off ? 0 : FRAME_SIZE;
+}
+
+int main(int argc, char *argv[])
+{
+    SceInt64 last;
+    Input in;
+    (void)argc; (void)argv;
+    setup_callbacks();
+    sceCtrlSetSamplingCycle(0);
+    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
+    gen_textures();
+    gfx_init();
+    save_load();
+    world_gen_static();
+    memset(&G, 0, sizeof(G));
+    memset(&P, 0, sizeof(P));
+    P.in_car = -1;
+    last = sceKernelGetSystemTimeWide();
 
     while (running) {
-        unsigned int now = sceKernelGetSystemTimeLow();
-        float dt = (now - last) / 1000000.0f; last = now;
-        if (dt > 0.1f) dt = 0.1f;
+        SceInt64 now = sceKernelGetSystemTimeWide();
+        float dt = (float)(now - last) / 1000000.0f;
+        last = now;
+        if (dt > 0.05f) dt = 0.05f;
+        if (dt < 0.001f) dt = 0.001f;
+        read_input(&in);
+        menu_t += dt;
+        if (G.msg_t > 0 && state != ST_PLAY) G.msg_t -= dt;
 
-        sceCtrlPeekBufferPositive(&pad, 1);
-        unsigned int pressed = pad.Buttons & ~oldButtons;
-        oldButtons = pad.Buttons;
-
-        if (appState != APP_PLAY) app_update(dt, pressed, pad.Buttons);
-        else if (mode == 1) pause_update(pressed);
-        else if (mode == 2) camp_update(pressed);
-        else if (mode == 3) death_update(dt, pressed);
-        else update(dt, &pad, pressed);
-
-        songId = (appState == APP_PLAY) ? ((chasers > 0) ? 3 : (nightness() > 0.5f ? 2 : 1))
-                                        : ((appState == APP_CREDITS || appState == APP_POST) ? 4 : 0);
-
-        sceGuStart(GU_DIRECT, list);
-        if (appState == APP_SPLASH || appState == APP_POST) {
-            sceGuClearColor(0xff000000);
-            sceGuClearDepth(0);
-            sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT | GU_FAST_CLEAR_BIT);
-        } else draw_scene();
-        if (appState == APP_PLAY) draw_ui(); else draw_app_ui();
-        sceGuFinish();
-        sceGuSync(0, 0);
-
-        sceDisplayWaitVblankStart();
-        sceGuSwapBuffers();
+        switch (state) {
+        case ST_MENU:
+            if (in.p & PSP_CTRL_DOWN) menu_sel = (menu_sel + 1) % 4;
+            if (in.p & PSP_CTRL_UP) menu_sel = (menu_sel + 3) % 4;
+            if (in.p & PSP_CTRL_CROSS) {
+                if (menu_sel == 0) { lobby_loop = 0; game_start(); state = ST_PLAY; }
+                else if (menu_sel == 1) state = ST_SHOP;
+                else if (menu_sel == 2) state = ST_LOBBY;
+                else running = 0;
+            }
+            frame_begin(); draw_menu(); frame_end();
+            break;
+        case ST_SHOP:
+            if (in.p & PSP_CTRL_RTRIGGER) shop_tab = (shop_tab + 1) % 3;
+            if (in.p & PSP_CTRL_LTRIGGER) shop_tab = (shop_tab + 2) % 3;
+            if (in.p & PSP_CTRL_DOWN) shop_sel[shop_tab] = (shop_sel[shop_tab] + 1) % shop_count(shop_tab);
+            if (in.p & PSP_CTRL_UP) shop_sel[shop_tab] = (shop_sel[shop_tab] + shop_count(shop_tab) - 1) % shop_count(shop_tab);
+            if (in.p & PSP_CTRL_CROSS) shop_buy();
+            if (in.p & PSP_CTRL_CIRCLE) { state = ST_MENU; save_write(); }
+            frame_begin(); draw_shop(); frame_end();
+            break;
+        case ST_LOBBY:
+            if (in.p & PSP_CTRL_SQUARE) lobby_loop = !lobby_loop;
+            if (in.p & PSP_CTRL_CROSS) { game_start(); state = ST_PLAY; }
+            if (in.p & PSP_CTRL_CIRCLE) { lobby_loop = 0; state = ST_MENU; }
+            frame_begin(); draw_lobby(); frame_end();
+            break;
+        case ST_PLAY:
+            if (in.p & PSP_CTRL_START) { state = ST_PAUSE; pause_sel = 0; }
+            else sim_play(&in, dt);
+            if (P.hp <= 0) { end_run(); state = ST_DEAD; }
+            frame_begin(); draw_play(); frame_end();
+            break;
+        case ST_PAUSE:
+            if (in.p & (PSP_CTRL_UP | PSP_CTRL_DOWN)) pause_sel ^= 1;
+            if (in.p & PSP_CTRL_START) state = ST_PLAY;
+            if (in.p & PSP_CTRL_CROSS) {
+                if (pause_sel == 0) state = ST_PLAY; else { end_run(); state = ST_MENU; }
+            }
+            frame_begin(); draw_play();
+            draw_overlay_text("PAUSA", RGBA(225, 225, 225, 255), 8);
+            text(176, 140, pause_sel == 0 ? 0xFF40E0FF : 0xFFB0B0B0, "%s Continuar", pause_sel == 0 ? ">" : " ");
+            text(176, 156, pause_sel == 1 ? 0xFF40E0FF : 0xFFB0B0B0, "%s Sair para o menu", pause_sel == 1 ? ">" : " ");
+            frame_end();
+            break;
+        case ST_DEAD:
+            if (in.p & PSP_CTRL_CROSS) state = ST_MENU;
+            frame_begin(); draw_play();
+            draw_overlay_text("VOCE MORREU", RGBA(200, 30, 30, 255), 7);
+            textc(130, 0xFFFFFFFF, "Onda %d   Mortes %d   Recrutados %d", G.wave, G.kills, G.recruited);
+            textc(146, 0xFF60FF60, "Dinheiro: $%d", sv.money);
+            textc(170, 0xFF40E0FF, "Pressione X para voltar ao menu");
+            frame_end();
+            break;
+        }
     }
-
+    save_write();
     sceGuTerm();
     sceKernelExitGame();
     return 0;
