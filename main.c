@@ -1,11 +1,11 @@
 /*
- * SOBREVIVENDO EM GS - PSP (PSPSDK) - acao e sobrevivencia em mundo aberto
+ * SOBREVIVENDO EM GS - PSP (PSPSDK) - acao e sobrevivencia em mundo aberto 3D
  * Desenvolvido por MECANIC ENGINE GAMER
  *
  * Controles:
  *   Analogico  : andar            L / R : girar camera
- *   X          : interagir (revistar, beber, acampamento, helicoptero)
- *   Quadrado   : atacar           Circulo : rolar (esquiva)
+ *   X          : interagir (pegar arma, revistar, beber, acampamento, helicoptero)
+ *   Quadrado   : atacar (segure para armas automaticas)   Circulo : rolar (esquiva)
  *   Triangulo  : trocar de arma   Esq/Dir : escolher item   Cima : usar item
  *   Start      : menu (salvar/sair)       Select : ajuda
  */
@@ -251,7 +251,10 @@ static int audio_thread(SceSize args, void *argp) {
 }
 
 /* ---------- dados do mundo ---------- */
-#define NITEMS  8
+#define NITEMS  10
+#define NITEMS_OLD 8
+#define NW      8
+#define NWP     10
 #define NLOOT   64
 #define NTREES  220
 #define NZ      40
@@ -270,12 +273,15 @@ static int audio_thread(SceSize args, void *argp) {
 #define LAKE_HX 14.0f
 #define LAKE_HZ 10.0f
 
-enum { I_MAD, I_SUC, I_PANO, I_COM, I_AGUA, I_BAND, I_MUN, I_PECA };
-static const char *itemName[NITEMS] = { "Madeira", "Sucata", "Pano", "Comida", "Agua", "Bandagem", "Municao", "Peca radio" };
-static const char *wName[3] = { "Bastao", "Machado", "Pistola" };
-static const float wDmg[3]   = { 18.0f, 36.0f, 30.0f };
-static const float wRange[3] = { 2.6f, 2.9f, 24.0f };
-static const float wCD[3]    = { 0.45f, 0.70f, 0.40f };
+enum { I_MAD, I_SUC, I_PANO, I_COM, I_AGUA, I_BAND, I_MUN, I_PECA, I_CART, I_RIFLE };
+static const char *itemName[NITEMS] = { "Madeira", "Sucata", "Pano", "Comida", "Agua", "Bandagem", "Municao", "Peca radio", "Cartuchos", "Balas rifle" };
+static const char *wName[NW] = { "Punhos", "Bastao", "Machado", "Facao", "Pistola", "SMG", "Escopeta", "Rifle" };
+static const float wDmg[NW]   = { 8.0f, 20.0f, 38.0f, 28.0f, 28.0f, 16.0f, 14.0f, 70.0f };
+static const float wRange[NW] = { 2.0f, 2.7f, 2.9f, 2.8f, 26.0f, 24.0f, 12.0f, 40.0f };
+static const float wCD[NW]    = { 0.35f, 0.45f, 0.70f, 0.38f, 0.40f, 0.13f, 0.85f, 1.00f };
+static const int   wAmmo[NW]  = { -1, -1, -1, -1, I_MUN, I_MUN, I_CART, I_RIFLE };
+static const int   wAuto[NW]  = { 0, 0, 0, 0, 0, 1, 0, 0 };
+static const int   wGive[NW]  = { 0, 0, 0, 0, 12, 30, 8, 6 };
 static const char *survNames[8] = { "Rafa", "Bia", "Leo", "Ana", "Dudu", "Nina", "Caio", "Lia" };
 static const char *diffNames[3] = { "Facil", "Normal", "Dificil" };
 static const float diffDmg[3]   = { 0.6f, 1.0f, 1.5f };
@@ -307,7 +313,8 @@ static const float CARS[NCARS][3] = {
 };
 
 typedef struct { float x, z; int kind, looted; float t; } Loot;
-typedef struct { float x, z, hx, hz, hr, tx, tz, hp, ang, t, atk, hurt, dead; int type, state, active, horde; } Zomb;
+typedef struct { float x, z, hx, hz, hr, tx, tz, hp, ang, t, atk, hurt, dead, corpse; int type, state, active, horde; } Zomb;
+typedef struct { float x, z; int w, taken; } WPick;
 typedef struct { float x, z, r; int n, brutes; } Zone;
 static const Zone ZONES[5] = {
     { 40, -37, 22, 10, 1 }, { 68, 53, 12, 5, 3 }, { -29, -55, 10, 3, 0 }, { 60, 20, 10, 3, 0 }, { -65, -15, 10, 3, 0 }
@@ -320,7 +327,8 @@ static Loot loot[NLOOT]; static int nloot = 0;
 static Zomb zomb[NZ];
 static float treeX[NTREES], treeZ[NTREES], treeH[NTREES];
 static int inv[NITEMS];
-static int hasW[3] = { 1, 0, 0 };
+static int hasW[NW] = { 1, 0, 0, 0, 0, 0, 0, 0 };
+static WPick wpick[NWP];
 static int curW = 0, selUse = 0, kills = 0, parts = 0, rescue = 0, deaths = 0, chasers = 0;
 static int mode = 0, menuSel = 0, showHelp = 1, endingSeen = 0;
 static float px = 3.0f, pz = 5.0f, cam = 0, pang = 0;
@@ -461,12 +469,21 @@ static void init_world(void) {
         z->hx = x; z->hz = zz; z->hr = 10.0f; z->active = 1; z->type = (frand() < 0.3f) ? 1 : 0;
         respawn_zombie(z);
     }
+    /* armas coletaveis espalhadas pelo mundo */
+    static const float WP[7][3] = { { -8, -2, 1 }, { 56, 14.5f, 2 }, { -31, -52, 3 }, { 30, -37, 4 }, { 64, 44, 5 }, { -62, -11, 6 }, { 78.5f, 43.5f, 7 } };
+    for (int i = 0; i < 7; i++) { wpick[i].x = WP[i][0]; wpick[i].z = WP[i][1]; wpick[i].w = (int)WP[i][2]; wpick[i].taken = 0; }
+    for (int i = 7; i < NWP; i++) {
+        float x, zz; int tries = 0;
+        do { x = (frand() * 2 - 1) * (WORLD - 8); zz = (frand() * 2 - 1) * (WORLD - 8); } while (++tries < 30 && blocked(x, zz, 3.0f));
+        wpick[i].x = x; wpick[i].z = zz; wpick[i].w = 1 + (int)(frand() * 4.0f); if (wpick[i].w > 4) wpick[i].w = 4; wpick[i].taken = 0;
+    }
 }
 
 static void reset_state(void) {
     memset(inv, 0, sizeof(inv));
     inv[I_COM] = 2; inv[I_AGUA] = 2; inv[I_BAND] = 1; inv[I_MAD] = 2; inv[I_MUN] = 0;
-    hasW[0] = 1; hasW[1] = 0; hasW[2] = 0; curW = 0; selUse = 0;
+    for (int i = 0; i < NW; i++) hasW[i] = 0;
+    hasW[0] = 1; curW = 0; selUse = 0;
     kills = 0; parts = 0; rescue = 0; deaths = 0; chasers = 0; mode = 0; menuSel = 0; showHelp = 1; endingSeen = 0;
     px = 3.0f; pz = 5.0f; cam = 0; pang = 0;
     hp = 100; hunger = 100; thirst = 100; stam = 100;
@@ -476,15 +493,17 @@ static void reset_state(void) {
 }
 
 /* ---------- salvar / carregar (3 slots) ---------- */
-#define SAVE_MAGIC 0x53564753u
-#define SAVE_DIR   "ms0:/PSP/SAVEDATA/SOBREVIVENDOGS"
+#define SAVE_MAGIC  0x53564753u
+#define SAVE_MAGIC2 0x32565347u
+#define SAVE_DIR    "ms0:/PSP/SAVEDATA/SOBREVIVENDOGS"
 typedef struct {
     unsigned int magic; int version;
     int worldSeed, difficulty, nameIdx, kills, parts, rescue, curW, selUse, deaths, endingSeen;
-    int inv[NITEMS], hasW[3];
+    int inv[NITEMS_OLD], hasW[3];
     float px, pz, cam, gameTime, hp, hunger, thirst, stam, rescueT;
     unsigned char looted[NLOOT]; float lootT[NLOOT];
 } SaveData;
+typedef struct { unsigned int magic; int inv2[2]; int hasW[NW]; int curW; unsigned char taken[NWP]; } SaveExtra;
 
 static void slot_path(int slot, char *out) { sprintf(out, SAVE_DIR "/save%d.dat", slot + 1); }
 
@@ -492,12 +511,17 @@ static int save_game(void) {
     SaveData d; memset(&d, 0, sizeof(d));
     d.magic = SAVE_MAGIC; d.version = 1;
     d.worldSeed = worldSeed; d.difficulty = difficulty; d.nameIdx = nameIdx; d.kills = kills; d.parts = parts;
-    d.rescue = rescue; d.curW = curW; d.selUse = selUse; d.deaths = deaths; d.endingSeen = endingSeen;
-    for (int i = 0; i < NITEMS; i++) d.inv[i] = inv[i];
-    for (int i = 0; i < 3; i++) d.hasW[i] = hasW[i];
+    d.rescue = rescue; d.selUse = selUse; d.deaths = deaths; d.endingSeen = endingSeen;
+    d.curW = (curW == 2) ? 1 : (curW == 4) ? 2 : 0;
+    for (int i = 0; i < NITEMS_OLD; i++) d.inv[i] = inv[i];
+    d.hasW[0] = hasW[1]; d.hasW[1] = hasW[2]; d.hasW[2] = hasW[4];
     d.px = px; d.pz = pz; d.cam = cam; d.gameTime = gameTime; d.hp = hp; d.hunger = hunger; d.thirst = thirst;
     d.stam = stam; d.rescueT = rescueT;
     for (int i = 0; i < nloot && i < NLOOT; i++) { d.looted[i] = (unsigned char)loot[i].looted; d.lootT[i] = loot[i].t; }
+    SaveExtra e; memset(&e, 0, sizeof(e));
+    e.magic = SAVE_MAGIC2; e.inv2[0] = inv[I_CART]; e.inv2[1] = inv[I_RIFLE]; e.curW = curW;
+    for (int i = 0; i < NW; i++) e.hasW[i] = hasW[i];
+    for (int i = 0; i < NWP; i++) e.taken[i] = (unsigned char)wpick[i].taken;
     sceIoMkdir("ms0:/PSP", 0777);
     sceIoMkdir("ms0:/PSP/SAVEDATA", 0777);
     sceIoMkdir(SAVE_DIR, 0777);
@@ -505,41 +529,54 @@ static int save_game(void) {
     int fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
     if (fd < 0) return 0;
     int w = sceIoWrite(fd, &d, sizeof(d));
+    int w2 = sceIoWrite(fd, &e, sizeof(e));
     sceIoClose(fd);
-    return w == (int)sizeof(d);
+    return w == (int)sizeof(d) && w2 == (int)sizeof(e);
 }
 
-static int read_slot(int slot, SaveData *d) {
+static int read_slot(int slot, SaveData *d, SaveExtra *e, int *hasE) {
     char p[96]; slot_path(slot, p);
     int fd = sceIoOpen(p, PSP_O_RDONLY, 0777);
     if (fd < 0) return 0;
     int r = sceIoRead(fd, d, sizeof(*d));
+    int r2 = sceIoRead(fd, e, sizeof(*e));
     sceIoClose(fd);
+    *hasE = (r2 == (int)sizeof(*e) && e->magic == SAVE_MAGIC2);
     return r == (int)sizeof(*d) && d->magic == SAVE_MAGIC && d->version == 1;
 }
 
 static void refresh_slots(void) {
     for (int s = 0; s < 3; s++) {
-        SaveData d; SlotInfo *si = &slotInfos[s]; memset(si, 0, sizeof(*si));
-        if (!read_slot(s, &d)) continue;
+        SaveData d; SaveExtra e; int he; SlotInfo *si = &slotInfos[s]; memset(si, 0, sizeof(*si));
+        if (!read_slot(s, &d, &e, &he)) continue;
         si->used = 1; si->nameIdx = (d.nameIdx >= 0 && d.nameIdx < 8) ? d.nameIdx : 0;
         si->day = (int)((d.gameTime / DAY_LEN * 24.0f + 8.0f) / 24.0f) + 1; si->parts = d.parts; si->kills = d.kills;
     }
 }
 
 static int load_game(void) {
-    SaveData d;
-    if (!read_slot(curSlot, &d)) return 0;
+    SaveData d; SaveExtra e; int he = 0;
+    if (!read_slot(curSlot, &d, &e, &he)) return 0;
     reset_state();
     worldSeed = d.worldSeed; difficulty = (d.difficulty >= 0 && d.difficulty < 3) ? d.difficulty : 1;
     nameIdx = (d.nameIdx >= 0 && d.nameIdx < 8) ? d.nameIdx : 0;
     seed_rng = seed_for(worldSeed);
     init_world();
-    kills = d.kills; parts = d.parts; rescue = (d.rescue == 1 || d.rescue == 2) ? 0 : d.rescue; curW = d.curW; selUse = d.selUse;
+    kills = d.kills; parts = d.parts; rescue = (d.rescue == 1 || d.rescue == 2) ? 0 : d.rescue; selUse = d.selUse;
     deaths = d.deaths; endingSeen = d.endingSeen ? 1 : 0;
-    for (int i = 0; i < NITEMS; i++) inv[i] = d.inv[i];
-    for (int i = 0; i < 3; i++) hasW[i] = d.hasW[i];
-    if (curW < 0 || curW > 2 || !hasW[curW]) curW = 0;
+    for (int i = 0; i < NITEMS_OLD; i++) inv[i] = d.inv[i];
+    if (he) {
+        inv[I_CART] = e.inv2[0]; inv[I_RIFLE] = e.inv2[1];
+        for (int i = 0; i < NW; i++) hasW[i] = e.hasW[i] ? 1 : 0;
+        curW = e.curW;
+        for (int i = 0; i < NWP; i++) wpick[i].taken = e.taken[i] ? 1 : 0;
+    } else {
+        static const int mp[3] = { 1, 2, 4 };
+        hasW[1] = d.hasW[0]; hasW[2] = d.hasW[1]; hasW[4] = d.hasW[2];
+        curW = (d.curW >= 0 && d.curW < 3) ? mp[d.curW] : 0;
+    }
+    hasW[0] = 1;
+    if (curW < 0 || curW >= NW || !hasW[curW]) curW = 0;
     if (selUse < 0 || selUse > 2) selUse = 0;
     px = d.px; pz = d.pz; cam = d.cam; gameTime = d.gameTime; hp = d.hp; hunger = d.hunger; thirst = d.thirst;
     stam = d.stam; rescueT = d.rescueT;
@@ -565,7 +602,7 @@ static void check_ending(void) {
 /* ---------- jogador ---------- */
 static void open_loot(int i) {
     static const int wt[7] = { 3, 3, 3, 2, 2, 1, 2 };   /* madeira sucata pano comida agua bandagem municao */
-    Loot *L = &loot[i]; int got[NITEMS]; memset(got, 0, sizeof(got));
+    Loot *L = &loot[i]; int got[NITEMS]; memset(got, 0, sizeof(got)); int wdrop = -1;
     if (L->kind == 0) {
         int rolls = 2 + (frand() < 0.5f ? 1 : 0);
         for (int r = 0; r < rolls; r++) {
@@ -581,6 +618,7 @@ static void open_loot(int i) {
         got[I_MUN] = 5 + (int)(frand() * 6);
         if (frand() < 0.6f) got[I_BAND] = 1;
         got[frand() < 0.5f ? I_COM : I_AGUA] = 1; got[I_SUC] += 1;
+        if (frand() < 0.15f) { int c = 4 + (int)(frand() * 4.0f); if (c > 7) c = 7; if (!hasW[c]) wdrop = c; }
     } else {
         got[I_PECA] = 1; got[I_MUN] = 2 + (int)(frand() * 3); got[I_BAND] = 1;
     }
@@ -590,6 +628,10 @@ static void open_loot(int i) {
         char t[24]; sprintf(t, "%s%d %s", n ? ", " : "", got[k], itemName[k]);
         if (strlen(b) + strlen(t) < 40) strcat(b, t);
         n++;
+    }
+    if (wdrop >= 0) {
+        hasW[wdrop] = 1; curW = wdrop; if (wAmmo[wdrop] >= 0) inv[wAmmo[wdrop]] += wGive[wdrop];
+        char t[24]; sprintf(t, "%s%s", n ? ", " : "", wName[wdrop]); if (strlen(b) + strlen(t) < 40) strcat(b, t);
     }
     char m[64]; sprintf(m, "Achou: %s", b[0] ? b : "nada");
     say(m); L->looted = 1; L->t = (L->kind == 3) ? 1e9f : 600.0f; play_sfx(L->kind == 3 ? 11 : 9);
@@ -606,7 +648,8 @@ static void hurt_player(float dmg) {
 }
 
 static void kill_zombie(Zomb *z) {
-    z->state = 2; z->dead = 90.0f + frand() * 60.0f; kills++; play_sfx(3);
+    z->state = 2; z->dead = 90.0f + frand() * 60.0f; z->corpse = 3.5f; kills++; play_sfx(3);
+    if (z->type == 2) { int it = (frand() < 0.5f) ? I_MUN : I_CART; inv[it] += 3; char mm[48]; sprintf(mm, "Brutamontes caiu! +3 %s", itemName[it]); say(mm); }
     if (frand() < 0.45f) {
         int it = (int)(frand() * 5); static const int tbl[5] = { I_PANO, I_SUC, I_COM, I_MUN, I_MAD };
         inv[tbl[it]]++; char m[48]; sprintf(m, "Zumbi derrubado! +1 %s", itemName[tbl[it]]); say(m);
@@ -631,34 +674,85 @@ static int nearest_zombie(float maxd, float *outd) {
     return best;
 }
 
+static int aim_target(float maxd, float maxAng) {
+    int best = -1; float bd = maxd;
+    for (int i = 0; i < NZ; i++) {
+        Zomb *z = &zomb[i];
+        if (!z->active || z->state == 2) continue;
+        float dx = z->x - px, dz = z->z - pz, d = sqrtf(dx * dx + dz * dz);
+        float da = atan2f(dx, dz) - pang;
+        while (da > PI_F) da -= 2.0f * PI_F;
+        while (da < -PI_F) da += 2.0f * PI_F;
+        if (d < bd && fabsf(da) < maxAng) { bd = d; best = i; }
+    }
+    return best;
+}
+
+static float ray_hit(float fx, float fz, float rng, int *hit) {
+    float bt = rng; *hit = -1;
+    for (int i = 0; i < NZ; i++) {
+        Zomb *z = &zomb[i];
+        if (!z->active || z->state == 2) continue;
+        float dx = z->x - px, dz = z->z - pz, along = dx * fx + dz * fz, perp = fabsf(dx * fz - dz * fx);
+        if (along > 0 && along < bt && perp < 0.9f) { bt = along; *hit = i; }
+    }
+    return bt;
+}
+
 static void player_attack(void) {
     if (attackCD > 0 || rollT > 0 || mode != 0) return;
-    float rng = wRange[curW];
-    if (curW == 2 && inv[I_MUN] <= 0) { say("Sem municao!"); play_sfx(10); attackCD = 0.3f; return; }
-    int t = nearest_zombie(curW == 2 ? 26.0f : 3.8f, NULL);
+    int w = curW, ai = wAmmo[w];
+    float rng = wRange[w];
+    if (ai >= 0 && inv[ai] <= 0) { say("Sem municao!"); play_sfx(10); attackCD = 0.3f; return; }
+    int t = aim_target(ai >= 0 ? rng : 3.8f, ai >= 0 ? 1.1f : 3.2f);
     if (t >= 0) pang = atan2f(zomb[t].x - px, zomb[t].z - pz);
     float fx = sinf(pang), fz = cosf(pang);
-    attackCD = wCD[curW];
-    if (curW == 2) {
-        inv[I_MUN]--; play_sfx(1); shotT = 0.1f;
-        int hit = -1; float bt = rng;
-        for (int i = 0; i < NZ; i++) {
-            Zomb *z = &zomb[i];
-            if (!z->active || z->state == 2) continue;
-            float dx = z->x - px, dz = z->z - pz, along = dx * fx + dz * fz, perp = fabsf(dx * fz - dz * fx);
-            if (along > 0 && along < bt && perp < 0.9f) { bt = along; hit = i; }
+    attackCD = wCD[w];
+    if (ai >= 0) {
+        inv[ai]--; play_sfx(1); shotT = 0.1f;
+        int hit; float bt;
+        if (w == 6) {
+            static const float off[5] = { -0.16f, -0.08f, 0.0f, 0.08f, 0.16f };
+            bt = rng;
+            for (int k = 0; k < 5; k++) {
+                float a2 = pang + off[k], gx = sinf(a2), gz = cosf(a2); int h2;
+                float t2 = ray_hit(gx, gz, rng, &h2);
+                if (k == 2) { bt = t2; fx = gx; fz = gz; }
+                if (h2 >= 0) damage_zombie(&zomb[h2], wDmg[w], gx, gz);
+            }
+        } else {
+            bt = ray_hit(fx, fz, rng, &hit);
+            if (hit >= 0) damage_zombie(&zomb[hit], wDmg[w], fx, fz);
         }
         shotX1 = px + fx * 0.8f; shotZ1 = pz + fz * 0.8f; shotX2 = px + fx * bt; shotZ2 = pz + fz * bt;
-        if (hit >= 0) damage_zombie(&zomb[hit], wDmg[2], fx, fz);
     } else {
         swingT = 0.18f; play_sfx(2);
         for (int i = 0; i < NZ; i++) {
             Zomb *z = &zomb[i];
             if (!z->active || z->state == 2) continue;
             float dx = z->x - px, dz = z->z - pz, d = sqrtf(dx * dx + dz * dz);
-            if (d < rng + 0.6f && (d < 0.3f || (dx * fx + dz * fz) / d > 0.2f)) damage_zombie(z, wDmg[curW], fx, fz);
+            if (d < rng + 0.6f && (d < 0.3f || (dx * fx + dz * fz) / d > 0.2f)) damage_zombie(z, wDmg[w], fx, fz);
         }
     }
+}
+
+static int nearest_wpick(void) {
+    int best = -1; float bd = 2.6f;
+    for (int i = 0; i < NWP; i++) {
+        if (wpick[i].taken) continue;
+        float d = dist2d(px, pz, wpick[i].x, wpick[i].z);
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+static void take_weapon(int i) {
+    int w = wpick[i].w; char m[64];
+    wpick[i].taken = 1;
+    if (wAmmo[w] >= 0) inv[wAmmo[w]] += wGive[w];
+    if (!hasW[w]) { hasW[w] = 1; curW = w; sprintf(m, "Pegou: %s!", wName[w]); }
+    else sprintf(m, "Ja tem %s: +%d %s", wName[w], wGive[w], wAmmo[w] >= 0 ? itemName[wAmmo[w]] : "nada");
+    say(m); play_sfx(9);
 }
 
 static void use_item(void) {
@@ -684,6 +778,8 @@ static void interact(void) {
     int l;
     if (near_heli()) { play_sfx(12); check_ending(); return; }
     if (near_camp()) { mode = 2; menuSel = 0; menuMsg[0] = 0; play_sfx(5); return; }
+    l = nearest_wpick();
+    if (l >= 0) { take_weapon(l); return; }
     l = nearest_loot();
     if (l >= 0) { open_loot(l); return; }
     if (near_lake()) {
@@ -704,6 +800,7 @@ static void zombies_update(float dt) {
         Zomb *z = &zomb[i];
         if (!z->active) continue;
         if (z->state == 2) {
+            if (z->corpse > 0) z->corpse -= dt;
             z->dead -= dt;
             if (z->dead <= 0 && i < NZREG) { z->state = 0; respawn_zombie(z); }
             continue;
@@ -774,15 +871,13 @@ static void camp_update(unsigned int pressed) {
             if (inv[I_PANO] >= 2) { inv[I_PANO] -= 2; inv[I_BAND]++; strcpy(menuMsg, "Fabricou 1 Bandagem!"); play_sfx(4); }
             else { strcpy(menuMsg, "Faltam materiais!"); play_sfx(10); }
         } else if (menuSel == 1) {
-            if (hasW[1]) { strcpy(menuMsg, "Voce ja tem o Machado!"); play_sfx(10); }
-            else if (inv[I_SUC] >= 3 && inv[I_MAD] >= 2) { inv[I_SUC] -= 3; inv[I_MAD] -= 2; hasW[1] = 1; curW = 1; strcpy(menuMsg, "Fabricou o Machado!"); play_sfx(4); }
+            if (inv[I_SUC] >= 2) { inv[I_SUC] -= 2; inv[I_MUN] += 6; strcpy(menuMsg, "Fabricou 6 Municao!"); play_sfx(4); }
             else { strcpy(menuMsg, "Faltam materiais!"); play_sfx(10); }
         } else if (menuSel == 2) {
-            if (hasW[2]) { strcpy(menuMsg, "Voce ja tem a Pistola!"); play_sfx(10); }
-            else if (inv[I_SUC] >= 6 && inv[I_MAD] >= 3) { inv[I_SUC] -= 6; inv[I_MAD] -= 3; hasW[2] = 1; curW = 2; strcpy(menuMsg, "Fabricou a Pistola!"); play_sfx(4); }
+            if (inv[I_SUC] >= 3) { inv[I_SUC] -= 3; inv[I_CART] += 4; strcpy(menuMsg, "Fabricou 4 Cartuchos!"); play_sfx(4); }
             else { strcpy(menuMsg, "Faltam materiais!"); play_sfx(10); }
         } else if (menuSel == 3) {
-            if (inv[I_SUC] >= 2) { inv[I_SUC] -= 2; inv[I_MUN] += 6; strcpy(menuMsg, "Fabricou 6 Municao!"); play_sfx(4); }
+            if (inv[I_SUC] >= 4) { inv[I_SUC] -= 4; inv[I_RIFLE] += 3; strcpy(menuMsg, "Fabricou 3 Balas de rifle!"); play_sfx(4); }
             else { strcpy(menuMsg, "Faltam materiais!"); play_sfx(10); }
         } else if (menuSel == 4) {
             do_sleep(); mode = 0;
@@ -888,10 +983,10 @@ static void update(float dt, const SceCtrlData *pad, unsigned int pressed) {
     if (pressed & PSP_CTRL_UP) use_item();
     if (pressed & PSP_CTRL_SELECT) showHelp = !showHelp;
     if (pressed & PSP_CTRL_TRIANGLE) {
-        for (int k = 1; k <= 3; k++) { int w = (curW + k) % 3; if (hasW[w]) { curW = w; break; } }
+        for (int k = 1; k <= NW; k++) { int w = (curW + k) % NW; if (hasW[w]) { curW = w; break; } }
         char m[40]; sprintf(m, "Arma: %s", wName[curW]); say(m); play_sfx(5);
     }
-    if (pressed & PSP_CTRL_SQUARE) player_attack();
+    if ((pressed & PSP_CTRL_SQUARE) || ((pad->Buttons & PSP_CTRL_SQUARE) && wAuto[curW])) player_attack();
     if (pressed & PSP_CTRL_CROSS) interact();
     if (pressed & PSP_CTRL_START) { mode = 1; menuSel = 0; menuMsg[0] = 0; }
 }
@@ -1043,86 +1138,90 @@ static void ui_shadow(int x, int y, int sc, unsigned int color, const char *s) {
     ui_text(x, y, sc, color, s);
 }
 
-/* ---------- personagens 2D (sprites) ---------- */
-#define SPR_W 12
-#define SPR_H 18
-#define SPR_MAXV 1700
-
-typedef struct { unsigned int color; float x, y, z; } CV;
-#define CV_TYPE (GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
-typedef struct { unsigned int hat, band, shirt, pants, boots, skin; int tool; unsigned int eye; } Pal;
-typedef struct { CV v[SPR_MAXV]; int n; } __attribute__((aligned(16))) Mesh;
-
-static const char *SPR_A[SPR_H] = {
-    "....cccc....", "...cccccc...", ".cccccccccc.", "...dddddd...", "...ssssss.gg", "...sesses.gg",
-    "...ssmmss.t.", "....ssss..t.", "..aaaaaaaat.", ".aaaaaaaaas.", ".aaaaaaaaat.", ".saaaaaaaat.",
-    "..aaaaaaaat.", "..bbbbbbbbt.", "..bbb..bbbt.", "..bbb..bbbt.", "..kkk..kkk..", "..kkk..kkk.."
+/* ---------- personagens e armas em 3D ---------- */
+typedef struct { float ox, oy, oz, sx, sy, sz; unsigned int col; } WPart;
+static const WPart WPARTS[NW][4] = {
+    { { 0, 0, 0, 0, 0, 0, 0 } },
+    { { 0, -0.04f, 0.5f, 0.09f, 0.09f, 1.0f, 0xff3a6a9a }, { 0, -0.07f, 0.95f, 0.14f, 0.14f, 0.3f, 0xff3a6a9a } },
+    { { 0, -0.035f, 0.5f, 0.07f, 0.07f, 1.0f, 0xff3a6a9a }, { 0, -0.17f, 0.92f, 0.05f, 0.34f, 0.24f, 0xffa0a8a8 } },
+    { { 0, -0.06f, 0.55f, 0.03f, 0.12f, 0.9f, 0xffd0d8d8 }, { 0, -0.04f, 0.05f, 0.05f, 0.08f, 0.22f, 0xff202830 } },
+    { { 0, -0.05f, 0.25f, 0.10f, 0.14f, 0.45f, 0xff484848 }, { 0, -0.2f, 0.08f, 0.09f, 0.2f, 0.12f, 0xff202020 } },
+    { { 0, -0.07f, 0.3f, 0.12f, 0.16f, 0.7f, 0xff404040 }, { 0, -0.3f, 0.25f, 0.08f, 0.24f, 0.1f, 0xff202020 },
+      { 0, -0.05f, -0.2f, 0.08f, 0.1f, 0.3f, 0xff303030 } },
+    { { 0, -0.04f, 0.6f, 0.09f, 0.09f, 1.2f, 0xff606870 }, { 0, -0.12f, -0.2f, 0.11f, 0.18f, 0.55f, 0xff3a6a9a },
+      { 0, -0.1f, 0.55f, 0.13f, 0.12f, 0.3f, 0xff2a4a6a } },
+    { { 0, -0.03f, 0.7f, 0.07f, 0.07f, 1.3f, 0xff505860 }, { 0, -0.09f, 0.05f, 0.11f, 0.16f, 0.65f, 0xff2a4a6a },
+      { 0, 0.06f, 0.35f, 0.06f, 0.06f, 0.3f, 0xff101010 }, { 0, -0.1f, -0.35f, 0.1f, 0.2f, 0.4f, 0xff2a4a6a } }
 };
-static const char *SPR_B[4] = { "..bbbbbbbbt.", "...bb..bb.t.", "...kk..kk...", "...kkk.kkk.." };
+static const int WPN[NW] = { 0, 2, 2, 2, 2, 3, 3, 4 };
 
-static const Pal PAL_PLAYER = { 0xff2040a0, 0xff182860, 0xff405830, 0xff604838, 0xff182028, 0xff90b8f0, 1, 0xff202020 };
-static const Pal PAL_Z[3] = {
-    { 0xff203030, 0xff203030, 0xff506890, 0xff404858, 0xff202020, 0xff60b080, 0, 0xff2020e0 },
-    { 0xff202040, 0xff202040, 0xff3030a0, 0xff303038, 0xff202020, 0xff70c090, 0, 0xff30d0ff },
-    { 0xff182018, 0xff182018, 0xff403060, 0xff303038, 0xff202020, 0xff508060, 0, 0xff2020e0 }
-};
-static const float Z_PS[3] = { 0.12f, 0.115f, 0.17f };
-
-static Mesh meshPlayer[2][2];
-static Mesh meshZ[3][2][2];
-
-static unsigned int pal_color(char ch, const Pal *p) {
-    switch (ch) {
-    case 'c': return p->hat;   case 'd': return p->band;
-    case 'a': return p->shirt; case 'b': return p->pants;
-    case 'k': return p->boots; case 's': return p->skin;
-    case 'e': return p->eye;   case 'm': return 0xff3030a0;
-    case 't': return p->tool ? 0xff3a6a9a : 0;
-    case 'g': return p->tool ? 0xffc0c0c0 : 0;
-    default: return 0;
-    }
-}
-static char spr_px(int r, int c, int frameB) {
-    if (r < 0 || r >= SPR_H || c < 0 || c >= SPR_W) return '.';
-    if (frameB && r >= 14) return SPR_B[r - 14][c];
-    return SPR_A[r][c];
-}
-static void add_quad(Mesh *m, float x0, float yb, float x1, float yt, unsigned int col) {
-    if (m->n + 6 > SPR_MAXV) return;
-    CV *v = &m->v[m->n];
-    float xs[6] = { x0, x1, x1, x0, x1, x0 }, ys[6] = { yb, yb, yt, yb, yt, yt };
-    for (int k = 0; k < 6; k++) { v[k].color = col; v[k].x = xs[k]; v[k].y = ys[k]; v[k].z = 0; }
-    m->n += 6;
-}
-static void build_mesh(Mesh *m, const Pal *p, int frameB, int flip, float ps) {
-    float sg = flip ? 1.0f : -1.0f;
-    m->n = 0;
-    for (int r = -1; r <= SPR_H; r++)
-        for (int c = -1; c <= SPR_W; c++) {
-            unsigned int col = pal_color(spr_px(r, c, frameB), p);
-            if (!col) {
-                if (pal_color(spr_px(r - 1, c, frameB), p) || pal_color(spr_px(r + 1, c, frameB), p) ||
-                    pal_color(spr_px(r, c - 1, frameB), p) || pal_color(spr_px(r, c + 1, frameB), p)) col = 0xff101830;
-                else continue;
-            }
-            add_quad(m, sg * (c - 6) * ps, (SPR_H - r - 1) * ps, sg * (c + 1 - 6) * ps, (SPR_H - r) * ps, col);
-        }
-}
-static void build_sprites(void) {
-    for (int f = 0; f < 2; f++) for (int fl = 0; fl < 2; fl++) {
-        build_mesh(&meshPlayer[f][fl], &PAL_PLAYER, f, fl, 0.12f);
-        for (int t = 0; t < 3; t++) build_mesh(&meshZ[t][f][fl], &PAL_Z[t], f, fl, Z_PS[t]);
-    }
-    sceKernelDcacheWritebackAll();
-}
-static void draw_sprite(const Mesh *m, float x, float z) {
-    ScePspFVector3 p = { x, 0.0f, z };
+/* arma presa na mao: pivo no ombro, gira com o braco; com pitch=-90 graus o eixo z da arma aponta para frente */
+static void weapon_part(float x, float y, float z, float yaw, float pitch, float armLen, const WPart *p) {
+    ScePspFVector3 t1 = { x, y, z }, t2 = { 0, -armLen, 0 }, t3 = { p->ox, p->oy, p->oz }, s = { p->sx, p->sy, p->sz };
     sceGumMatrixMode(GU_MODEL);
     sceGumLoadIdentity();
-    sceGumTranslate(&p);
-    sceGumRotateY(cam);
+    sceGumTranslate(&t1); sceGumRotateY(yaw); sceGumRotateX(pitch); sceGumTranslate(&t2);
+    sceGumRotateX(1.5708f); sceGumTranslate(&t3); sceGumScale(&s);
     sceGumUpdateMatrix();
-    sceGumDrawArray(GU_TRIANGLES, CV_TYPE, m->n, 0, m->v);
+    sceGuColor(p->col);
+    sceGumDrawArray(GU_TRIANGLES, VTX_TYPE, 36, 0, cube);
+}
+static void draw_weapon(int w, float x, float y, float z, float yaw, float pitch, float armLen) {
+    for (int k = 0; k < WPN[w]; k++) weapon_part(x, y, z, yaw, pitch, armLen, &WPARTS[w][k]);
+}
+
+/* parte do corpo: origem no chao, gira com o personagem; hang=1 faz o bloco pender do pivo (bracos e pernas) */
+static void body_part(float x, float z, float yaw, float ox, float oy, float oz, float pitch, int hang,
+                      float sx, float sy, float sz, unsigned int col) {
+    ScePspFVector3 t1 = { x, 0, z }, t2 = { ox, oy, oz }, t3 = { 0, -sy, 0 }, s = { sx, sy, sz };
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumTranslate(&t1); sceGumRotateY(yaw); sceGumTranslate(&t2);
+    if (pitch != 0.0f) sceGumRotateX(pitch);
+    if (hang) sceGumTranslate(&t3);
+    sceGumScale(&s);
+    sceGumUpdateMatrix();
+    sceGuColor(col);
+    sceGumDrawArray(GU_TRIANGLES, VTX_TYPE, 36, 0, cube);
+}
+
+typedef struct { unsigned int skin, shirt, pants, hair, eye; } HPal;
+static const HPal HPAL_PLAYER = { 0xff90b8f0, 0xff405830, 0xff604838, 0xff2040a0, 0xff202020 };
+static const HPal HPAL_Z[3] = {
+    { 0xff60b080, 0xff506890, 0xff404858, 0xff203030, 0xff2020e0 },
+    { 0xff70c090, 0xff3030a0, 0xff303038, 0xff202040, 0xff30d0ff },
+    { 0xff508060, 0xff403060, 0xff303038, 0xff182018, 0xff2020e0 }
+};
+static const HPal HPAL_HIT = { 0xffd0d0ff, 0xffc0c0ff, 0xffb0b0ff, 0xffd0d0ff, 0xff20e0ff };
+static const float Z_K[3] = { 1.0f, 0.95f, 1.45f };
+
+static void draw_humanoid(float x, float z, float yaw, float k, const HPal *p, float legSw, float armL, float armR,
+                          int weapon, int lod, int player) {
+    float c = cosf(yaw), s = sinf(yaw);
+    if (lod) {
+        body_part(x, z, yaw, 0, 0.0f, 0, 0, 0, 0.55f * k, 1.55f * k, 0.32f * k, p->shirt);
+        body_part(x, z, yaw, 0, 1.5f * k, 0, 0, 0, 0.42f * k, 0.42f * k, 0.42f * k, p->skin);
+        return;
+    }
+    body_part(x, z, yaw, -0.16f * k, 0.85f * k, 0, legSw, 1, 0.24f * k, 0.85f * k, 0.26f * k, p->pants);
+    body_part(x, z, yaw,  0.16f * k, 0.85f * k, 0, -legSw, 1, 0.24f * k, 0.85f * k, 0.26f * k, p->pants);
+    body_part(x, z, yaw, 0, 0.85f * k, 0, 0, 0, 0.62f * k, 0.7f * k, 0.34f * k, p->shirt);
+    body_part(x, z, yaw, 0, 1.55f * k, 0, 0, 0, 0.42f * k, 0.4f * k, 0.4f * k, p->skin);
+    body_part(x, z, yaw, 0, 1.93f * k, 0, 0, 0, 0.46f * k, 0.12f * k, 0.46f * k, p->hair);
+    body_part(x, z, yaw, -0.1f * k, 1.72f * k, 0.2f * k, 0, 0, 0.07f * k, 0.07f * k, 0.05f * k, p->eye);
+    body_part(x, z, yaw,  0.1f * k, 1.72f * k, 0.2f * k, 0, 0, 0.07f * k, 0.07f * k, 0.05f * k, p->eye);
+    if (player) {
+        body_part(x, z, yaw, 0, 1.86f * k, 0.25f * k, 0, 0, 0.32f * k, 0.05f * k, 0.18f * k, p->hair);
+        body_part(x, z, yaw, 0, 0.95f * k, -0.26f * k, 0, 0, 0.44f * k, 0.52f * k, 0.2f * k, 0xff304048);
+    }
+    body_part(x, z, yaw, -0.40f * k, 1.5f * k, 0, armR, 1, 0.18f * k, 0.7f * k, 0.18f * k, p->shirt);
+    body_part(x, z, yaw,  0.40f * k, 1.5f * k, 0, armL, 1, 0.18f * k, 0.7f * k, 0.18f * k, p->shirt);
+    if (weapon > 0) draw_weapon(weapon, x - 0.40f * k * c, 1.5f * k, z + 0.40f * k * s, yaw, armR, 0.7f * k);
+}
+
+static void draw_corpse(float x, float z, float yaw, float k, const HPal *p) {
+    body_part(x, z, yaw, 0, 0.2f * k, 0, -1.5708f, 0, 0.6f * k, 1.55f * k, 0.34f * k, p->shirt);
+    body_part(x, z, yaw, 0, 0.05f * k, -1.75f * k, 0, 0, 0.42f * k, 0.42f * k, 0.42f * k, p->skin);
 }
 
 /* ---------- cena ---------- */
@@ -1266,6 +1365,18 @@ static void draw_scene(void) {
         }
     }
 
+    /* armas coletaveis no chao */
+    for (int i = 0; i < NWP; i++) {
+        WPick *wp = &wpick[i];
+        if (wp->taken) continue;
+        float d = dist2d(px, pz, wp->x, wp->z);
+        if (d > 60.0f) continue;
+        float by = 0.9f + 0.12f * sinf(gameTime * 2.5f + i);
+        draw_weapon(wp->w, wp->x, by, wp->z, gameTime * 1.5f, -1.5708f, 0.0f);
+        box(wp->x, 0.0f, wp->z, 0.9f, 0.08f, 0.9f, 0, 0xffe0e040);
+        if (d < 45.0f) box(wp->x, 0.0f, wp->z, 0.12f, 6.0f, 0.12f, 0, 0xffe0e040);
+    }
+
     /* arvores */
     for (int i = 0; i < NTREES; i++) {
         float tdx = treeX[i] - px, tdz = treeZ[i] - pz;
@@ -1289,18 +1400,46 @@ static void draw_scene(void) {
     /* sombras */
     box(px, 0.1f, pz, 1.0f, 0.02f, 0.6f, 0, 0xff000000);
     for (int i = 0; i < NZ; i++)
-        if (zomb[i].active && zomb[i].state != 2 && NEAR(zomb[i].x, zomb[i].z, 60)) box(zomb[i].x, 0.1f, zomb[i].z, 1.0f, 0.02f, 0.6f, 0, 0xff000000);
+        if (zomb[i].active && zomb[i].state != 2 && NEAR(zomb[i].x, zomb[i].z, 50))
+            box(zomb[i].x, 0.1f, zomb[i].z, 1.0f * Z_K[zomb[i].type], 0.02f, 0.7f * Z_K[zomb[i].type], 0, 0xff000000);
 
-    /* sprites 2D (sem luz) */
-    sceGuDisable(GU_LIGHTING);
+    /* zumbis em 3D */
     for (int i = 0; i < NZ; i++) {
         Zomb *z = &zomb[i];
-        if (!z->active || z->state == 2 || !NEAR(z->x, z->z, 65)) continue;
-        float rx = -cosf(cam), rz = sinf(cam), side = sinf(z->ang) * rx + cosf(z->ang) * rz;
-        int fl = (side > 0) ? 0 : 1, fr = (z->state == 1) ? (((int)(gameTime * 6.0f + i)) & 1) : 0;
-        draw_sprite(&meshZ[z->type][fr][fl], z->x, z->z);
+        if (!z->active) continue;
+        float d = dist2d(px, pz, z->x, z->z);
+        if (d > 60.0f) continue;
+        float k = Z_K[z->type];
+        if (z->state == 2) { if (z->corpse > 0) draw_corpse(z->x, z->z, z->ang, k, &HPAL_Z[z->type]); continue; }
+        float ph = gameTime * (z->state == 1 ? 7.0f : 2.5f) + i * 1.7f;
+        float sw = sinf(ph) * (z->state == 1 ? 0.8f : 0.35f);
+        float arm = -1.35f + sinf(ph * 0.7f) * 0.15f;
+        if (z->atk > 0.6f) arm = -1.95f + sinf(gameTime * 20.0f) * 0.2f;
+        draw_humanoid(z->x, z->z, z->ang, k, z->hurt > 0 ? &HPAL_HIT : &HPAL_Z[z->type], sw, arm, arm, 0, d > 38.0f, 0);
     }
-    if (mode != 3) draw_sprite(&meshPlayer[moving ? (((int)walkPhase) & 1) : 0][facingRight ? 0 : 1], px, pz);
+
+    /* jogador em 3D */
+    {
+        float sw = moving ? sinf(walkPhase) * 0.8f : 0.0f, aR, aL;
+        if (curW >= 4) { aR = -1.45f + (shotT > 0 ? 0.18f : 0.0f); aL = -1.25f; }
+        else {
+            aR = -0.7f - sw * 0.4f; aL = sw * 0.6f;
+            if (swingT > 0) aR = -2.6f + (1.0f - swingT / 0.18f) * 2.8f;
+        }
+        if (mode == 3) draw_corpse(px, pz, pang, 1.0f, &HPAL_PLAYER);
+        else draw_humanoid(px, pz, pang, rollT > 0 ? 0.8f : 1.0f, hurtT > 0.25f ? &HPAL_HIT : &HPAL_PLAYER, sw, aL, aR, curW, 0, 1);
+    }
+
+    /* na tela de titulo: zumbis ao lado, olhando para o personagem */
+    if (appState != APP_PLAY && appState != APP_SPLASH && appState != APP_POST) {
+        float rx = -cosf(cam), rz = sinf(cam), fx2 = sinf(cam), fz2 = cosf(cam);
+        float sw = sinf(appT * 3.0f) * 0.3f;
+        float zx = px - rx * 8.0f + fx2 * 1.0f, zz = pz - rz * 8.0f + fz2 * 1.0f;
+        draw_humanoid(zx, zz, atan2f(px - zx, pz - zz), 1.0f, &HPAL_Z[0], sw, -1.35f, -1.35f, 0, 0, 0);
+        float wx = px + rx * 8.5f + fx2 * 2.0f, wz = pz + rz * 8.5f + fz2 * 2.0f;
+        draw_humanoid(wx, wz, atan2f(px - wx, pz - wz), 1.45f, &HPAL_Z[2], -sw, -1.35f, -1.35f, 0, 0, 0);
+    }
+    sceGuDisable(GU_LIGHTING);
 }
 
 /* ---------- interface ---------- */
@@ -1338,6 +1477,7 @@ static void draw_minimap(void) {
     minimap_dot(BASE_X, BASE_Z, 4, 0xff40d040, 1);
     if (rescue > 0) minimap_dot(HELI_X, HELI_Z, 4, 0xffe08040, 1);
     for (int i = 0; i < nloot; i++) if (loot[i].kind == 3 && !loot[i].looted) minimap_dot(loot[i].x, loot[i].z, 3, 0xff30e0ff, 1);
+    for (int i = 0; i < NWP; i++) if (!wpick[i].taken) minimap_dot(wpick[i].x, wpick[i].z, 3, 0xffe040e0, 0);
     for (int i = 0; i < NZ; i++) if (zomb[i].active && zomb[i].state != 2) minimap_dot(zomb[i].x, zomb[i].z, 2, zomb[i].state == 1 ? 0xff2020ff : 0xff3030a0, 0);
     rect2d(440, 36, 445, 41, 0xffffffff);
 }
@@ -1363,7 +1503,7 @@ static void draw_ui(void) {
     ui_text(4, 66, 1, 0xff40e0ff, buf);
     draw_minimap();
     rect2d(330, 76, 476, 100, 0x90000000);
-    if (curW == 2) sprintf(buf, "%s  Mun:%d", wName[curW], inv[I_MUN]); else sprintf(buf, "%s", wName[curW]);
+    if (wAmmo[curW] >= 0) sprintf(buf, "%s  %s:%d", wName[curW], itemName[wAmmo[curW]], inv[wAmmo[curW]]); else strcpy(buf, wName[curW]);
     ui_text(334, 80, 1, 0xffffffff, buf);
     { static const int ci[3] = { I_COM, I_AGUA, I_BAND };
       sprintf(buf, "< %s x%d >  Cima: usar", itemName[ci[selUse]], inv[ci[selUse]]);
@@ -1392,6 +1532,7 @@ static void draw_ui(void) {
         const char *pr = NULL; char pb[64];
         if (near_heli()) pr = "X: embarcar no helicoptero!";
         else if (near_camp()) pr = "ACAMPAMENTO  X: abrir";
+        else if (nearest_wpick() >= 0) { sprintf(pb, "X: pegar %s", wName[wpick[nearest_wpick()].w]); pr = pb; }
         else {
             int l = nearest_loot();
             if (l >= 0) pr = loot[l].kind == 3 ? "X: pegar peca de radio!" : (loot[l].kind == 1 ? "X: revistar carro" : "X: revistar");
@@ -1433,17 +1574,17 @@ static void draw_ui(void) {
             int y = 54 + i * 21;
             if (i == menuSel) rect2d(46, y - 3, 434, y + 16, 0xc0a06020);
             if (i == 0) strcpy(buf, "Bandagem (2 Pano)");
-            else if (i == 1) strcpy(buf, hasW[1] ? "Machado (feito)" : "Machado (3 Sucata 2 Madeira)");
-            else if (i == 2) strcpy(buf, hasW[2] ? "Pistola (feita)" : "Pistola (6 Sucata 3 Madeira)");
-            else if (i == 3) strcpy(buf, "Municao x6 (2 Sucata)");
+            else if (i == 1) strcpy(buf, "Municao x6 (2 Sucata)");
+            else if (i == 2) strcpy(buf, "Cartuchos x4 (3 Sucata)");
+            else if (i == 3) strcpy(buf, "Balas de rifle x3 (4 Sucata)");
             else if (i == 4) strcpy(buf, "Dormir ate amanhecer");
             else if (i == 5) sprintf(buf, "Radio: chamar resgate (%d/4)", parts);
             else strcpy(buf, "Sair");
             ui_text(56, y, 2, 0xffffffff, buf);
         }
-        sprintf(buf, "Madeira:%d Sucata:%d Pano:%d Bandagem:%d Municao:%d", inv[I_MAD], inv[I_SUC], inv[I_PANO], inv[I_BAND], inv[I_MUN]);
+        sprintf(buf, "Madeira:%d Sucata:%d Pano:%d Bandagem:%d Pecas:%d/4", inv[I_MAD], inv[I_SUC], inv[I_PANO], inv[I_BAND], parts);
         ui_text(46, 204, 1, 0xffc0ffc0, buf);
-        sprintf(buf, "Comida:%d Agua:%d Pecas de radio:%d/4", inv[I_COM], inv[I_AGUA], parts);
+        sprintf(buf, "Municao:%d Cartuchos:%d Balas rifle:%d Comida:%d Agua:%d", inv[I_MUN], inv[I_CART], inv[I_RIFLE], inv[I_COM], inv[I_AGUA]);
         ui_text(46, 214, 1, 0xffc0ffc0, buf);
         ui_text(46, 224, 1, 0xffc0c0c0, "Cima/Baixo + X escolhe   START/O sai");
         if (menuMsg[0]) ui_text(46, 235, 2, 0xff60ff60, menuMsg);
@@ -1463,20 +1604,6 @@ static void draw_ui(void) {
 }
 
 /* ---------- telas: abertura, titulo, novo jogo, carregar, creditos ---------- */
-static void draw_art(const char *const *rows, int h, int w, int x, int y, int sc, const Pal *pal) {
-    for (int r = 0; r < h; r++) {
-        int c = 0;
-        while (c < w) {
-            unsigned int col = pal_color(rows[r][c], pal);
-            if (!col) { c++; continue; }
-            int c2 = c + 1;
-            while (c2 < w && pal_color(rows[r][c2], pal) == col) c2++;
-            rect2d(x + c * sc, y + r * sc, x + c2 * sc, y + (r + 1) * sc, col);
-            c = c2;
-        }
-    }
-}
-
 typedef struct { const char *t; int sc; unsigned int col; } CLine;
 static const CLine CREDITS[] = {
     { "SOBREVIVENDO EM GS", 3, 0xff40e0ff },
@@ -1545,8 +1672,6 @@ static void draw_app_ui(void) {
             sprintf(buf, "%s %s", i == titleSel ? ">" : " ", to[i]);
             ui_text(146, y, 2, 0xffffffff, buf);
         }
-        draw_art(SPR_A, SPR_H, SPR_W, 30, 160, 4, &PAL_PLAYER);
-        draw_art(SPR_A, SPR_H, SPR_W, 396, 160, 4, &PAL_Z[0]);
         ui_center(254, 1, 0xffc0c0c0, "(c) MECANIC ENGINE GAMER - Sobrevivendo Em GS");
     } else if (appState == APP_NEW) {
         rect2d(0, 0, 480, 272, 0x80000000);
@@ -1695,7 +1820,6 @@ int main(void) {
 
     build_cube();
     build_ground();
-    build_sprites();
     reset_state();
     seed_rng = seed_for(0);
     init_world();
