@@ -29,7 +29,7 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
 #define SCR_H   272
 #define FRAME   0x88000
 #define PI_F    3.14159265f
-#define WORLD   95.0f
+#define WORLD   130.0f
 
 typedef struct { float nx, ny, nz, x, y, z; } Vtx;
 #define VTX_TYPE (GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
@@ -37,7 +37,7 @@ typedef struct { float nx, ny, nz, x, y, z; } Vtx;
 static unsigned int __attribute__((aligned(16))) list[262144];
 static Vtx __attribute__((aligned(16))) cube[36];
 #define GTILE 12.0f
-#define GN    16
+#define GN    22
 static Vtx __attribute__((aligned(16))) groundA[GN * GN / 2 * 6];
 static Vtx __attribute__((aligned(16))) groundB[GN * GN / 2 * 6];
 
@@ -86,7 +86,7 @@ static void build_ground(void) {
     int na = 0, nb = 0;
     for (int i = 0; i < GN; i++) {
         for (int j = 0; j < GN; j++) {
-            float x0 = -96.0f + i * GTILE, z0 = -96.0f + j * GTILE;
+            float x0 = -(GN * GTILE) / 2.0f + i * GTILE, z0 = -(GN * GTILE) / 2.0f + j * GTILE;
             float x1 = x0 + GTILE, z1 = z0 + GTILE;
             float xs[6] = { x0, x1, x1, x0, x1, x0 };
             float zs[6] = { z0, z0, z1, z0, z1, z1 };
@@ -343,6 +343,8 @@ static float gameTime = 0, rescueT = 0, hordeT = 0, attackCD = 0, swingT = 0, ro
 static float hurtT = 0, shotT = 0, shotX1 = 0, shotZ1 = 0, shotX2 = 0, shotZ2 = 0, moanCD = 0, drinkCD = 0;
 static float msgTimer = 0, deathT = 0;
 static int facingRight = 1, moving = 0;
+static int firstPerson = 0, coins = 0, shopSel = 0;
+static char shopMsg[48] = "";
 static float walkPhase = 0;
 static char msg[64] = "", menuMsg[48] = "";
 static unsigned int seed_rng = 12345;
@@ -502,6 +504,7 @@ static void reset_state(void) {
     gameTime = 0; rescueT = 0; hordeT = 0; attackCD = 0; swingT = 0; rollT = 0; hurtT = 0; shotT = 0;
     moanCD = 0; drinkCD = 0; msgTimer = 0; deathT = 0; msg[0] = 0; menuMsg[0] = 0;
     facingRight = 1; moving = 0; walkPhase = 0;
+    coins = 0; firstPerson = 0;
 }
 
 /* ---------- salvar / carregar (3 slots) ---------- */
@@ -518,6 +521,9 @@ typedef struct {
 typedef struct { unsigned int magic; int inv2[2]; int hasW[NW]; int curW; unsigned char taken[NWP]; } SaveExtra;
 #define SAVE_MAGIC3 0x33565347u
 typedef struct { unsigned int magic; unsigned char state[NSURV]; float hp[NSURV], x[NSURV], z[NSURV]; } SaveExtra3;
+#define SAVE_MAGIC4 0x34565347u
+typedef struct { unsigned int magic; int coins, firstPerson; } SaveExtra4;
+static SaveExtra4 gExtra4; static int gHasExtra4 = 0;
 static SaveExtra3 gSurv; static int gHasSurv = 0;
 
 static void slot_path(int slot, char *out) { sprintf(out, SAVE_DIR "/save%d.dat", slot + 1); }
@@ -548,12 +554,14 @@ static int save_game(void) {
     SaveExtra3 f3; memset(&f3, 0, sizeof(f3)); f3.magic = SAVE_MAGIC3;
     for (int i = 0; i < NSURV; i++) { f3.state[i] = (unsigned char)surv[i].state; f3.hp[i] = surv[i].hp; f3.x[i] = surv[i].x; f3.z[i] = surv[i].z; }
     sceIoWrite(fd, &f3, sizeof(f3));
+    SaveExtra4 f4; memset(&f4, 0, sizeof(f4)); f4.magic = SAVE_MAGIC4; f4.coins = coins; f4.firstPerson = firstPerson;
+    sceIoWrite(fd, &f4, sizeof(f4));
     sceIoClose(fd);
     return w == (int)sizeof(d) && w2 == (int)sizeof(e);
 }
 
 static int read_slot(int slot, SaveData *d, SaveExtra *e, int *hasE) {
-    gHasSurv = 0;
+    gHasSurv = 0; gHasExtra4 = 0;
     char p[96]; slot_path(slot, p);
     int fd = sceIoOpen(p, PSP_O_RDONLY, 0777);
     if (fd < 0) return 0;
@@ -562,6 +570,9 @@ static int read_slot(int slot, SaveData *d, SaveExtra *e, int *hasE) {
     SaveExtra3 f3; int r3 = sceIoRead(fd, &f3, sizeof(f3));
     gHasSurv = (r3 == (int)sizeof(f3) && f3.magic == SAVE_MAGIC3);
     if (gHasSurv) gSurv = f3;
+    SaveExtra4 f4; int r4b = sceIoRead(fd, &f4, sizeof(f4));
+    gHasExtra4 = (r4b == (int)sizeof(f4) && f4.magic == SAVE_MAGIC4);
+    if (gHasExtra4) gExtra4 = f4;
     sceIoClose(fd);
     *hasE = (r2 == (int)sizeof(*e) && e->magic == SAVE_MAGIC2);
     return r == (int)sizeof(*d) && d->magic == SAVE_MAGIC && d->version == 1;
@@ -604,6 +615,8 @@ static int load_game(void) {
     stam = d.stam; rescueT = d.rescueT;
     if (hp < 20) hp = 20;
     for (int i = 0; i < nloot && i < NLOOT; i++) { loot[i].looted = d.looted[i] ? 1 : 0; loot[i].t = d.lootT[i]; }
+    coins = gHasExtra4 ? gExtra4.coins : 0;
+    firstPerson = gHasExtra4 ? (gExtra4.firstPerson ? 1 : 0) : 0;
     if (gHasSurv) {
         int nf = 0;
         for (int i = 0; i < NSURV; i++) {
@@ -689,7 +702,7 @@ static void hurt_player(float dmg) {
 }
 
 static void kill_zombie(Zomb *z) {
-    z->state = 2; z->dead = 90.0f + frand() * 60.0f; z->corpse = 3.5f; kills++; play_sfx(3);
+    z->state = 2; z->dead = 90.0f + frand() * 60.0f; z->corpse = 3.5f; kills++; coins += (z->type == 2) ? 5 : 2; play_sfx(3);
     if (z->type == 2) { int it = (frand() < 0.5f) ? I_MUN : I_CART; inv[it] += 3; char mm[48]; sprintf(mm, "Brutamontes caiu! +3 %s", itemName[it]); say(mm); }
     if (frand() < 0.45f) {
         int it = (int)(frand() * 5); static const int tbl[5] = { I_PANO, I_SUC, I_COM, I_MUN, I_MAD };
@@ -1029,18 +1042,44 @@ static void camp_update(unsigned int pressed) {
     }
 }
 
+/* ---------- loja (moedas ganhas ao derrotar zumbis) ---------- */
+#define NSHOP 6
+static const char *shopName[NSHOP] = { "Bandagem x3", "Municao x12", "Cartuchos x6", "Comida x3", "Agua x3", "Balas de rifle x4" };
+static const int   shopCost[NSHOP] = { 5, 8, 10, 4, 4, 12 };
+static const int   shopQty[NSHOP]  = { 3, 12, 6, 3, 3, 4 };
+static const int   shopItem[NSHOP] = { I_BAND, I_MUN, I_CART, I_COM, I_AGUA, I_RIFLE };
+
+static void shop_buy(int i) {
+    if (coins < shopCost[i]) { strcpy(shopMsg, "Moedas insuficientes."); play_sfx(10); return; }
+    coins -= shopCost[i]; inv[shopItem[i]] += shopQty[i];
+    sprintf(shopMsg, "Comprou %s!", shopName[i]); play_sfx(4);
+}
+
+static void coin_shop_update(unsigned int pressed) {
+    if (pressed & PSP_CTRL_UP)   { shopSel = (shopSel + NSHOP + 1) % (NSHOP + 2); play_sfx(5); }
+    if (pressed & PSP_CTRL_DOWN) { shopSel = (shopSel + 1) % (NSHOP + 2); play_sfx(5); }
+    if (pressed & (PSP_CTRL_START | PSP_CTRL_CIRCLE)) { mode = 1; return; }
+    if (pressed & PSP_CTRL_CROSS) {
+        if (shopSel < NSHOP) shop_buy(shopSel);
+        else if (shopSel == NSHOP) strcpy(shopMsg, "Em breve: multijogador!");
+        else mode = 1;
+    }
+}
+
 static void pause_update(unsigned int pressed) {
-    if (pressed & PSP_CTRL_UP)   { menuSel = (menuSel + 5) % 6; play_sfx(5); }
-    if (pressed & PSP_CTRL_DOWN) { menuSel = (menuSel + 1) % 6; play_sfx(5); }
+    if (pressed & PSP_CTRL_UP)   { menuSel = (menuSel + 7) % 8; play_sfx(5); }
+    if (pressed & PSP_CTRL_DOWN) { menuSel = (menuSel + 1) % 8; play_sfx(5); }
     if (pressed & (PSP_CTRL_START | PSP_CTRL_CIRCLE)) { mode = 0; return; }
     if (pressed & PSP_CTRL_CROSS) {
         if (menuSel == 0) mode = 0;
         else if (menuSel == 1) { musicOn = !musicOn; play_sfx(5); }
-        else if (menuSel == 2) strcpy(menuMsg, save_game() ? "Jogo salvo!" : "Erro ao salvar!");
-        else if (menuSel == 3) {
+        else if (menuSel == 2) { firstPerson = !firstPerson; play_sfx(5); }
+        else if (menuSel == 3) { mode = 7; shopSel = 0; shopMsg[0] = 0; play_sfx(4); }
+        else if (menuSel == 4) strcpy(menuMsg, save_game() ? "Jogo salvo!" : "Erro ao salvar!");
+        else if (menuSel == 5) {
             if (save_game()) { mode = 0; appState = APP_TITLE; titleSel = 0; }
             else strcpy(menuMsg, "Erro ao salvar!");
-        } else if (menuSel == 4) { mode = 0; appState = APP_TITLE; titleSel = 0; }
+        } else if (menuSel == 6) { mode = 0; appState = APP_TITLE; titleSel = 0; }
         else running = 0;
     }
 }
@@ -1053,6 +1092,25 @@ static void death_update(float dt, unsigned int pressed) {
         px = 3.0f; pz = 5.0f; rollT = 0; hurtT = 0; mode = 0; say("Voce renasceu no acampamento.");
         for (int i = 0; i < NZ; i++) if (zomb[i].active && zomb[i].state == 1 && dist2d(px, pz, zomb[i].x, zomb[i].z) < 20.0f) zomb[i].state = 0;
     }
+}
+
+/* ---------- multijogador: preparacao (pacote de rede; transporte ainda nao ligado) ---------- */
+#define MP_MAGIC 0x4D
+#define MP_MAX   4
+typedef struct { unsigned char magic, id, state, pad; float x, z, ang; short hp; short pad2; } NetPacket;
+typedef struct { int used, id, state, hp; float x, z, ang; } NetPlayer;
+static NetPlayer netRemote[MP_MAX];
+static int mpEnabled = 0;
+static void net_pack_me(NetPacket *pk) {
+    memset(pk, 0, sizeof(*pk));
+    pk->magic = MP_MAGIC; pk->id = 0; pk->state = (mode == 3) ? 2 : 1;
+    pk->x = px; pk->z = pz; pk->ang = pang; pk->hp = (short)hp;
+}
+static int net_unpack(const NetPacket *pk, NetPlayer *out) {
+    if (pk->magic != MP_MAGIC || pk->id >= MP_MAX) return 0;
+    out->used = 1; out->id = pk->id; out->state = pk->state; out->hp = pk->hp;
+    out->x = pk->x; out->z = pk->z; out->ang = pk->ang;
+    return 1;
 }
 
 static void update(float dt, const SceCtrlData *pad, unsigned int pressed) {
@@ -1096,6 +1154,7 @@ static void update(float dt, const SceCtrlData *pad, unsigned int pressed) {
         if (side > 0.15f) facingRight = 1; else if (side < -0.15f) facingRight = 0;
         walkPhase += dt * 8.0f;
     } else walkPhase = 0;
+    if (firstPerson) pang = cam;
     stam += 16.0f * dt; if (stam > 100) stam = 100;
 
     hunger -= 0.10f * dt; thirst -= 0.15f * dt;
@@ -1476,8 +1535,10 @@ static void draw_scene(void) {
     sceGumPerspective(70.0f, 16.0f / 9.0f, 1.0f, 200.0f);
     sceGumMatrixMode(GU_VIEW);
     sceGumLoadIdentity();
-    ScePspFVector3 eye = { px - sinf(cam) * 11.0f, 7.0f, pz - cosf(cam) * 11.0f };
-    ScePspFVector3 ctr = { px, 1.5f, pz };
+    float ex = px - sinf(cam) * 11.0f, ey = 7.0f, ez = pz - cosf(cam) * 11.0f, ccx = px, ccy = 1.5f, ccz = pz;
+    if (firstPerson) { ex = px; ey = 1.75f; ez = pz; ccx = px + sinf(cam) * 10.0f; ccy = 1.6f; ccz = pz + cosf(cam) * 10.0f; }
+    ScePspFVector3 eye = { ex, ey, ez };
+    ScePspFVector3 ctr = { ccx, ccy, ccz };
     ScePspFVector3 up  = { 0, 1, 0 };
     sceGumLookAt(&eye, &ctr, &up);
 
@@ -1589,7 +1650,7 @@ static void draw_scene(void) {
             if (swingT > 0) aR = -2.6f + (1.0f - swingT / 0.18f) * 2.8f;
         }
         if (mode == 3) draw_corpse(px, pz, pang, 1.0f, &HPAL_PLAYER);
-        else draw_humanoid(px, pz, pang, rollT > 0 ? 0.8f : 1.0f, hurtT > 0.25f ? &HPAL_HIT : &HPAL_PLAYER, sw, aL, aR, curW, 0, 1);
+        else if (!firstPerson) draw_humanoid(px, pz, pang, rollT > 0 ? 0.8f : 1.0f, hurtT > 0.25f ? &HPAL_HIT : &HPAL_PLAYER, sw, aL, aR, curW, 0, 1);
     }
 
     /* na tela de titulo: zumbis ao lado, olhando para o personagem */
@@ -1600,6 +1661,11 @@ static void draw_scene(void) {
         draw_humanoid(zx, zz, atan2f(px - zx, pz - zz), 1.0f, &HPAL_Z[0], sw, -1.35f, -1.35f, 0, 0, 0);
         float wx = px + rx * 8.5f + fx2 * 2.0f, wz = pz + rz * 8.5f + fz2 * 2.0f;
         draw_humanoid(wx, wz, atan2f(px - wx, pz - wz), 1.45f, &HPAL_Z[2], -sw, -1.35f, -1.35f, 0, 0, 0);
+    }
+    if (firstPerson && mode != 3) {
+        /* arma na mao, vista de primeira pessoa */
+        float vx = px + sinf(cam) * 0.9f + cosf(cam) * 0.45f, vz = pz + cosf(cam) * 0.9f - sinf(cam) * 0.45f;
+        draw_weapon(curW, vx, 1.35f, vz, cam, (curW >= 4) ? -1.5708f : -1.1f, 0.15f);
     }
     sceGuDisable(GU_LIGHTING);
 }
@@ -1725,22 +1791,23 @@ static void draw_ui(void) {
         if (hurtT > 0) rect2d(0, 0, 480, 272, ((unsigned int)(hurtT / 0.4f * 110.0f) << 24) | 0x000000ff);
         if (hp < 25 && ((int)(gameTime * 3.0f) & 1)) rect2d(0, 0, 480, 272, 0x300000ff);
     } else if (mode == 1) {
-        static const char *opt[6] = { "Continuar", "", "", "Salvar e ir ao menu", "Menu sem salvar", "Sair do jogo" };
+        static const char *opt[8] = { "Continuar", "", "", "Loja", "", "Salvar e ir ao menu", "Menu sem salvar", "Sair do jogo" };
         rect2d(0, 0, 480, 272, 0x80000000);
-        window(96, 30, 384, 242);
-        ui_text(180, 38, 2, 0xff40e0ff, "== MENU ==");
+        window(96, 22, 384, 250);
+        ui_text(180, 30, 2, 0xff40e0ff, "== MENU ==");
         sprintf(buf, "%s - slot %d - %s", survNames[nameIdx], curSlot + 1, diffNames[difficulty]);
-        ui_text(108, 56, 1, 0xffc0c0c0, buf);
-        for (int i = 0; i < 6; i++) {
-            int y = 68 + i * 20;
-            if (i == menuSel) rect2d(106, y - 3, 374, y + 17, 0xc0a06020);
+        ui_text(108, 48, 1, 0xffc0c0c0, buf);
+        for (int i = 0; i < 8; i++) {
+            int y = 62 + i * 17;
+            if (i == menuSel) rect2d(106, y - 2, 374, y + 14, 0xc0a06020);
             if (i == 1) sprintf(buf, "%s Musica: %s", i == menuSel ? ">" : " ", musicOn ? "ligada" : "desligada");
-            else if (i == 2) sprintf(buf, "%s Salvar (slot %d)", i == menuSel ? ">" : " ", curSlot + 1);
+            else if (i == 2) sprintf(buf, "%s Visao: %s", i == menuSel ? ">" : " ", firstPerson ? "1a pessoa" : "3a pessoa");
+            else if (i == 4) sprintf(buf, "%s Salvar (slot %d)", i == menuSel ? ">" : " ", curSlot + 1);
             else sprintf(buf, "%s %s", i == menuSel ? ">" : " ", opt[i]);
             ui_text(110, y, 2, 0xffffffff, buf);
         }
-        ui_text(108, 194, 1, 0xffc0c0c0, "Cima/Baixo + X     START volta");
-        if (menuMsg[0]) ui_text(110, 208, 2, 0xff60ff60, menuMsg);
+        ui_text(108, 210, 1, 0xffc0c0c0, "Cima/Baixo + X     START volta");
+        if (menuMsg[0]) ui_text(110, 224, 2, 0xff60ff60, menuMsg);
     } else if (mode == 2) {
         rect2d(0, 0, 480, 272, 0x80000000);
         window(36, 24, 444, 254);
@@ -1763,6 +1830,23 @@ static void draw_ui(void) {
         ui_text(46, 214, 1, 0xffc0ffc0, buf);
         ui_text(46, 224, 1, 0xffc0c0c0, "Cima/Baixo + X escolhe   START/O sai");
         if (menuMsg[0]) ui_text(46, 235, 2, 0xff60ff60, menuMsg);
+    } else if (mode == 7) {
+        rect2d(0, 0, 480, 272, 0x80000000);
+        window(36, 24, 444, 254);
+        ui_text(170, 30, 2, 0xff40e0ff, "== LOJA ==");
+        sprintf(buf, "Moedas: %d", coins);
+        ui_text(56, 50, 2, 0xfff0e040, buf);
+        for (int i = 0; i < NSHOP + 2; i++) {
+            int y = 74 + i * 15;
+            if (i == shopSel) rect2d(46, y - 2, 434, y + 12, 0xc0a06020);
+            if (i < NSHOP) {
+                ui_text(56, y, 1, 0xffffffff, shopName[i]);
+                sprintf(buf, "%d moedas", shopCost[i]); ui_text(330, y, 1, 0xff40e0ff, buf);
+            } else if (i == NSHOP) ui_text(56, y, 1, 0xff909090, "Multijogador (em breve)");
+            else ui_text(56, y, 1, 0xffffffff, "Voltar");
+        }
+        ui_text(46, 216, 1, 0xffc0c0c0, "Cima/Baixo + X comprar    O/START voltar");
+        if (shopMsg[0]) ui_text(46, 230, 1, 0xff60ff60, shopMsg);
     } else if (mode == 3) {
         rect2d(0, 0, 480, 272, 0xc0000020);
         ui_center(80, 4, 0xff2020e0, "VOCE MORREU");
@@ -2037,6 +2121,7 @@ int main(void) {
         if (appState != APP_PLAY) app_update(dt, pressed, pad.Buttons);
         else if (mode == 1) pause_update(pressed);
         else if (mode == 2) camp_update(pressed);
+        else if (mode == 7) coin_shop_update(pressed);
         else if (mode == 3) death_update(dt, pressed);
         else update(dt, &pad, pressed);
 
