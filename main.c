@@ -329,6 +329,12 @@ static float treeX[NTREES], treeZ[NTREES], treeH[NTREES];
 static int inv[NITEMS];
 static int hasW[NW] = { 1, 0, 0, 0, 0, 0, 0, 0 };
 static WPick wpick[NWP];
+#define NSURV 6
+#define MAXFOL 3
+#define SV_RECRUIT_FOOD 2
+typedef struct { float x, z, ang, hp, shootCD, hurt, corpse; int state, name; } Surv; /* state: 0 selvagem, 1 seguindo, 2 morto */
+static Surv surv[NSURV];
+static void init_survivors(void);
 static int curW = 0, selUse = 0, kills = 0, parts = 0, rescue = 0, deaths = 0, chasers = 0;
 static int mode = 0, menuSel = 0, showHelp = 1, endingSeen = 0;
 static float px = 3.0f, pz = 5.0f, cam = 0, pang = 0;
@@ -437,6 +443,7 @@ static void respawn_zombie(Zomb *z) {
 
 static void init_world(void) {
     nloot = 0;
+    init_survivors();
     for (int i = 0; i < 8; i++) add_loot(BLD[i].x, BLD[i].z + BLD[i].door * (BLD[i].hd + 1.3f), 0);
     add_loot(-29, -51.2f, 0);                       /* posto */
     add_loot(60, 24.8f, 0);                         /* fazenda */
@@ -447,6 +454,11 @@ static void init_world(void) {
         float x, z; int tries = 0;
         do { x = (frand() * 2 - 1) * (WORLD - 6); z = (frand() * 2 - 1) * (WORLD - 6); } while (++tries < 30 && blocked(x, z, 3.0f));
         add_loot(x, z, 0);
+    }
+    for (int i = 0; i < 14; i++) {
+        float x, z; int tries = 0;
+        do { x = (frand() * 2 - 1) * (WORLD - 6); z = (frand() * 2 - 1) * (WORLD - 6); } while (++tries < 30 && (blocked(x, z, 3.0f) || dist2d(x, z, BASE_X, BASE_Z) < 16.0f));
+        add_loot(x, z, 4);
     }
     for (int i = 0; i < NTREES; i++) {
         float x, z; int tries = 0;
@@ -504,6 +516,9 @@ typedef struct {
     unsigned char looted[NLOOT]; float lootT[NLOOT];
 } SaveData;
 typedef struct { unsigned int magic; int inv2[2]; int hasW[NW]; int curW; unsigned char taken[NWP]; } SaveExtra;
+#define SAVE_MAGIC3 0x33565347u
+typedef struct { unsigned int magic; unsigned char state[NSURV]; float hp[NSURV], x[NSURV], z[NSURV]; } SaveExtra3;
+static SaveExtra3 gSurv; static int gHasSurv = 0;
 
 static void slot_path(int slot, char *out) { sprintf(out, SAVE_DIR "/save%d.dat", slot + 1); }
 
@@ -530,16 +545,23 @@ static int save_game(void) {
     if (fd < 0) return 0;
     int w = sceIoWrite(fd, &d, sizeof(d));
     int w2 = sceIoWrite(fd, &e, sizeof(e));
+    SaveExtra3 f3; memset(&f3, 0, sizeof(f3)); f3.magic = SAVE_MAGIC3;
+    for (int i = 0; i < NSURV; i++) { f3.state[i] = (unsigned char)surv[i].state; f3.hp[i] = surv[i].hp; f3.x[i] = surv[i].x; f3.z[i] = surv[i].z; }
+    sceIoWrite(fd, &f3, sizeof(f3));
     sceIoClose(fd);
     return w == (int)sizeof(d) && w2 == (int)sizeof(e);
 }
 
 static int read_slot(int slot, SaveData *d, SaveExtra *e, int *hasE) {
+    gHasSurv = 0;
     char p[96]; slot_path(slot, p);
     int fd = sceIoOpen(p, PSP_O_RDONLY, 0777);
     if (fd < 0) return 0;
     int r = sceIoRead(fd, d, sizeof(*d));
     int r2 = sceIoRead(fd, e, sizeof(*e));
+    SaveExtra3 f3; int r3 = sceIoRead(fd, &f3, sizeof(f3));
+    gHasSurv = (r3 == (int)sizeof(f3) && f3.magic == SAVE_MAGIC3);
+    if (gHasSurv) gSurv = f3;
     sceIoClose(fd);
     *hasE = (r2 == (int)sizeof(*e) && e->magic == SAVE_MAGIC2);
     return r == (int)sizeof(*d) && d->magic == SAVE_MAGIC && d->version == 1;
@@ -582,6 +604,15 @@ static int load_game(void) {
     stam = d.stam; rescueT = d.rescueT;
     if (hp < 20) hp = 20;
     for (int i = 0; i < nloot && i < NLOOT; i++) { loot[i].looted = d.looted[i] ? 1 : 0; loot[i].t = d.lootT[i]; }
+    if (gHasSurv) {
+        int nf = 0;
+        for (int i = 0; i < NSURV; i++) {
+            surv[i].state = gSurv.state[i] <= 2 ? gSurv.state[i] : 0;
+            surv[i].hp = gSurv.hp[i] > 0 ? gSurv.hp[i] : 80;
+            surv[i].x = gSurv.x[i]; surv[i].z = gSurv.z[i];
+            if (surv[i].state == 1 && ++nf > MAXFOL) surv[i].state = 0;
+        }
+    }
     return 1;
 }
 
@@ -604,7 +635,7 @@ static void open_loot(int i) {
     static const int wt[7] = { 3, 3, 3, 2, 2, 1, 2 };   /* madeira sucata pano comida agua bandagem municao */
     Loot *L = &loot[i]; int got[NITEMS]; memset(got, 0, sizeof(got)); int wdrop = -1;
     if (L->kind == 0) {
-        int rolls = 2 + (frand() < 0.5f ? 1 : 0);
+        int rolls = 2 + (frand() < 0.5f ? 1 : 0) + (dist2d(L->x, L->z, BASE_X, BASE_Z) > 45.0f ? 1 : 0);
         for (int r = 0; r < rolls; r++) {
             float tot = 16.0f, v = frand() * tot, acc = 0; int it = 0;
             for (int k = 0; k < 7; k++) { acc += wt[k]; if (v <= acc) { it = k; break; } it = k; }
@@ -614,6 +645,16 @@ static void open_loot(int i) {
         got[I_SUC] = 1 + (int)(frand() * 3);
         if (frand() < 0.4f) got[I_MUN] = 2 + (int)(frand() * 3);
         if (frand() < 0.25f) got[I_COM] = 1;
+    } else if (L->kind == 4) {
+        int rolls = 1 + (frand() < 0.5f ? 1 : 0);
+        for (int r = 0; r < rolls; r++) {
+            float v = frand();
+            if (v < 0.35f) got[I_COM] += 1;
+            else if (v < 0.6f) got[I_AGUA] += 1;
+            else if (v < 0.8f) got[I_BAND] += 1;
+            else if (v < 0.92f) got[I_MUN] += 3 + (int)(frand() * 3.0f);
+            else got[I_CART] += 2 + (int)(frand() * 2.0f);
+        }
     } else if (L->kind == 2) {
         got[I_MUN] = 5 + (int)(frand() * 6);
         if (frand() < 0.6f) got[I_BAND] = 1;
@@ -774,10 +815,102 @@ static int nearest_loot(void) {
     return best;
 }
 
+/* ---------- sobreviventes (recrutar e seguir) ---------- */
+static void init_survivors(void) {
+    for (int i = 0; i < NSURV; i++) {
+        Surv *sv = &surv[i]; float x, z; int tries = 0;
+        do { x = (frand() * 2 - 1) * (WORLD - 10); z = (frand() * 2 - 1) * (WORLD - 10); }
+        while (++tries < 40 && (blocked(x, z, 3.0f) || dist2d(x, z, BASE_X, BASE_Z) < 30.0f));
+        sv->x = x; sv->z = z; sv->ang = frand() * 6.28f; sv->hp = 80; sv->state = 0; sv->name = i;
+        sv->hurt = 0; sv->corpse = 0; sv->shootCD = 0;
+    }
+}
+
+static int surv_followers(void) { int n = 0; for (int i = 0; i < NSURV; i++) if (surv[i].state == 1) n++; return n; }
+
+static int nearest_wild_surv(float maxd) {
+    int best = -1; float bd = maxd;
+    for (int i = 0; i < NSURV; i++) {
+        if (surv[i].state != 0) continue;
+        float d = dist2d(px, pz, surv[i].x, surv[i].z);
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+static int nearest_follower(float x, float z, float maxd) {
+    int best = -1; float bd = maxd;
+    for (int i = 0; i < NSURV; i++) {
+        if (surv[i].state != 1) continue;
+        float d = dist2d(x, z, surv[i].x, surv[i].z);
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+static void surv_hurt(int i, float dmg) {
+    Surv *sv = &surv[i];
+    sv->hp -= dmg * diffDmg[difficulty]; sv->hurt = 0.3f;
+    if (sv->hp <= 0) {
+        sv->hp = 0; sv->state = 2; sv->corpse = 3.0f;
+        char m[48]; sprintf(m, "%s caiu em combate!", survNames[sv->name]); say(m); play_sfx(6);
+    }
+}
+
+static void recruit(int i) {
+    char m[64];
+    if (surv_followers() >= MAXFOL) { say("Grupo cheio (3/3)."); play_sfx(10); return; }
+    if (inv[I_COM] < SV_RECRUIT_FOOD) {
+        sprintf(m, "%s pede %d comida para entrar.", survNames[surv[i].name], SV_RECRUIT_FOOD); say(m); play_sfx(10); return;
+    }
+    inv[I_COM] -= SV_RECRUIT_FOOD;
+    surv[i].state = 1; surv[i].shootCD = 0.5f;
+    sprintf(m, "%s entrou para o grupo!", survNames[surv[i].name]); say(m); play_sfx(9);
+}
+
+static void update_survivors(float dt) {
+    int slot = 0;
+    for (int i = 0; i < NSURV; i++) {
+        Surv *sv = &surv[i];
+        if (sv->hurt > 0) sv->hurt -= dt;
+        if (sv->corpse > 0) sv->corpse -= dt;
+        if (sv->state != 1 || mode == 3) continue;
+        /* posicao no grupo: atras e aos lados do jogador */
+        float side = (slot % 2) ? 1.3f : -1.3f, back = 1.8f + (slot / 2) * 1.4f;
+        slot++;
+        float tx = px - sinf(pang) * back + cosf(pang) * side;
+        float tz = pz - cosf(pang) * back - sinf(pang) * side;
+        float dx = tx - sv->x, dz = tz - sv->z, d = sqrtf(dx * dx + dz * dz);
+        if (d > 18.0f) { sv->x = tx; sv->z = tz; }
+        else if (d > 0.7f) {
+            float sp = 7.0f * dt; if (sp > d) sp = d;
+            sv->x += dx / d * sp; sv->z += dz / d * sp; sv->ang = atan2f(dx, dz);
+        }
+        collide(&sv->x, &sv->z, 0.5f);
+        /* combate: atira (pistola) no zumbi mais perto dentro de 10 */
+        if (sv->shootCD > 0) sv->shootCD -= dt;
+        int zt = -1; float zb = 10.0f;
+        for (int k = 0; k < NZ; k++) {
+            Zomb *z = &zomb[k];
+            if (!z->active || z->state == 2) continue;
+            float zd = dist2d(sv->x, sv->z, z->x, z->z);
+            if (zd < zb) { zb = zd; zt = k; }
+        }
+        if (zt >= 0 && sv->shootCD <= 0) {
+            Zomb *z = &zomb[zt];
+            sv->ang = atan2f(z->x - sv->x, z->z - sv->z);
+            sv->shootCD = 0.9f;
+            damage_zombie(z, 14.0f, sinf(sv->ang), cosf(sv->ang));
+        }
+    }
+}
+
 static void interact(void) {
     int l;
     if (near_heli()) { play_sfx(12); check_ending(); return; }
     if (near_camp()) { mode = 2; menuSel = 0; menuMsg[0] = 0; play_sfx(5); return; }
+    l = nearest_wild_surv(3.0f);
+    if (l >= 0) { recruit(l); return; }
     l = nearest_wpick();
     if (l >= 0) { take_weapon(l); return; }
     l = nearest_loot();
@@ -823,7 +956,13 @@ static void zombies_update(float dt) {
             if (inSafe || (!z->horde && d > aggro * 2.0f)) z->state = 0;
             else {
                 if (d > 1.0f) { z->x += dx / d * sp * dt; z->z += dz / d * sp * dt; } if (d > 0.01f) z->ang = atan2f(dx, dz);
-                if (d < 1.7f && z->atk <= 0) { z->atk = 1.0f; hurt_player(zDmg[z->type]); }
+                if (z->atk <= 0) {
+                    if (d < 1.7f) { z->atk = 1.0f; hurt_player(zDmg[z->type]); }
+                    else {
+                        int fo = nearest_follower(z->x, z->z, 1.7f);
+                        if (fo >= 0) { z->atk = 1.0f; surv_hurt(fo, zDmg[z->type]); }
+                    }
+                }
                 if (d < 22.0f) chasers++;
             }
         }
@@ -853,6 +992,7 @@ static void do_sleep(void) {
     float skip = (target - hrs) / 24.0f * DAY_LEN;
     gameTime += skip;
     hp += 60; if (hp > 100) hp = 100;
+    for (int i = 0; i < NSURV; i++) if (surv[i].state == 1) surv[i].hp = 100;
     hunger -= 15; if (hunger < 5) hunger = 5;
     thirst -= 20; if (thirst < 5) thirst = 5;
     for (int i = 0; i < nloot; i++) if (loot[i].looted && loot[i].kind != 3) { loot[i].t -= skip; if (loot[i].t <= 0) loot[i].looted = 0; }
@@ -977,6 +1117,7 @@ static void update(float dt, const SceCtrlData *pad, unsigned int pressed) {
         if (rescueT <= 0) { rescue = 0; say("O helicoptero foi embora... chame de novo."); }
     }
     zombies_update(dt);
+    update_survivors(dt);
 
     if (pressed & PSP_CTRL_LEFT)  { selUse = (selUse + 2) % 3; play_sfx(5); }
     if (pressed & PSP_CTRL_RIGHT) { selUse = (selUse + 1) % 3; play_sfx(5); }
@@ -1194,6 +1335,11 @@ static const HPal HPAL_Z[3] = {
 };
 static const HPal HPAL_HIT = { 0xffd0d0ff, 0xffc0c0ff, 0xffb0b0ff, 0xffd0d0ff, 0xff20e0ff };
 static const float Z_K[3] = { 1.0f, 0.95f, 1.45f };
+static const HPal HPAL_SURV[3] = {
+    { 0xff90b8f0, 0xff3050a0, 0xff403020, 0xff202020, 0xff202020 },
+    { 0xffa0c0e0, 0xffa04040, 0xff304050, 0xff606060, 0xff202020 },
+    { 0xffe0c0a0, 0xff408040, 0xff504030, 0xffc0a060, 0xff202020 }
+};
 
 static void draw_humanoid(float x, float z, float yaw, float k, const HPal *p, float legSw, float armL, float armR,
                           int weapon, int lod, int player) {
@@ -1418,6 +1564,22 @@ static void draw_scene(void) {
         draw_humanoid(z->x, z->z, z->ang, k, z->hurt > 0 ? &HPAL_HIT : &HPAL_Z[z->type], sw, arm, arm, 0, d > 38.0f, 0);
     }
 
+    /* sobreviventes em 3D: selvagens com farol ciano, do grupo com marcador verde */
+    for (int i = 0; i < NSURV; i++) {
+        Surv *sv = &surv[i];
+        float d = dist2d(px, pz, sv->x, sv->z);
+        if (sv->state == 2) { if (sv->corpse > 0 && d < 60.0f) draw_corpse(sv->x, sv->z, sv->ang, 1.0f, &HPAL_SURV[sv->name % 3]); continue; }
+        if (d > 60.0f) continue;
+        if (sv->state == 0) {
+            if (d < 45.0f) box(sv->x, 0.0f, sv->z, 0.12f, 6.0f, 0.12f, 0, 0xff30e0ff);
+            draw_humanoid(sv->x, sv->z, sv->ang, 1.0f, sv->hurt > 0 ? &HPAL_HIT : &HPAL_SURV[sv->name % 3], 0.05f * sinf(gameTime * 2.0f + i), -0.2f, -0.2f, 0, d > 38.0f, 0);
+        } else {
+            float ph = gameTime * 7.0f + i * 1.3f;
+            draw_humanoid(sv->x, sv->z, sv->ang, 1.0f, sv->hurt > 0 ? &HPAL_HIT : &HPAL_SURV[sv->name % 3], 0.7f * sinf(ph), 0.2f * sinf(ph), -1.3f, 4, d > 38.0f, 0);
+            box(sv->x, 2.6f, sv->z, 0.25f, 0.25f, 0.25f, 0, 0xff40ff40);
+        }
+    }
+
     /* jogador em 3D */
     {
         float sw = moving ? sinf(walkPhase) * 0.8f : 0.0f, aR, aL;
@@ -1478,6 +1640,7 @@ static void draw_minimap(void) {
     if (rescue > 0) minimap_dot(HELI_X, HELI_Z, 4, 0xffe08040, 1);
     for (int i = 0; i < nloot; i++) if (loot[i].kind == 3 && !loot[i].looted) minimap_dot(loot[i].x, loot[i].z, 3, 0xff30e0ff, 1);
     for (int i = 0; i < NWP; i++) if (!wpick[i].taken) minimap_dot(wpick[i].x, wpick[i].z, 3, 0xffe040e0, 0);
+    for (int i = 0; i < NSURV; i++) if (surv[i].state != 2) minimap_dot(surv[i].x, surv[i].z, 3, surv[i].state == 1 ? 0xff40ff40 : 0xff40e0ff, 1);
     for (int i = 0; i < NZ; i++) if (zomb[i].active && zomb[i].state != 2) minimap_dot(zomb[i].x, zomb[i].z, 2, zomb[i].state == 1 ? 0xff2020ff : 0xff3030a0, 0);
     rect2d(440, 36, 445, 41, 0xffffffff);
 }
@@ -1501,6 +1664,8 @@ static void draw_ui(void) {
     else if (rescue == 1) strcpy(buf, "Obj: sobreviva ate o resgate!");
     else strcpy(buf, "Obj: embarque no helicoptero!");
     ui_text(4, 66, 1, 0xff40e0ff, buf);
+    sprintf(buf, "Grupo: %d/%d  (X: recrutar)", surv_followers(), MAXFOL);
+    ui_text(4, 78, 1, 0xffffffff, buf);
     draw_minimap();
     rect2d(330, 76, 476, 100, 0x90000000);
     if (wAmmo[curW] >= 0) sprintf(buf, "%s  %s:%d", wName[curW], itemName[wAmmo[curW]], inv[wAmmo[curW]]); else strcpy(buf, wName[curW]);
@@ -1516,6 +1681,12 @@ static void draw_ui(void) {
     }
 
     if (mode == 0) {
+        {   /* mira no centro da tela: vermelha quando ha alvo ao alcance */
+            int tg = aim_target(wAmmo[curW] >= 0 ? wRange[curW] : 3.8f, wAmmo[curW] >= 0 ? 1.1f : 3.2f);
+            unsigned int cc = (tg >= 0) ? 0xff4040ff : 0xffffffff;
+            rect2d(232, 135, 248, 137, cc);
+            rect2d(239, 127, 241, 145, cc);
+        }
         if (showHelp) {
             rect2d(0, 86, 250, 126, 0x90000000);
             ui_text(4, 90, 1, 0xffffffff, "Analog:andar  L/R:camera  X:interagir");
@@ -1532,6 +1703,10 @@ static void draw_ui(void) {
         const char *pr = NULL; char pb[64];
         if (near_heli()) pr = "X: embarcar no helicoptero!";
         else if (near_camp()) pr = "ACAMPAMENTO  X: abrir";
+        else if (nearest_wild_surv(3.0f) >= 0) {
+            int sv = nearest_wild_surv(3.0f);
+            sprintf(pb, "X: recrutar %s (%d comida)", survNames[surv[sv].name], SV_RECRUIT_FOOD); pr = pb;
+        }
         else if (nearest_wpick() >= 0) { sprintf(pb, "X: pegar %s", wName[wpick[nearest_wpick()].w]); pr = pb; }
         else {
             int l = nearest_loot();
