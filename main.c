@@ -251,7 +251,7 @@ static int audio_thread(SceSize args, void *argp) {
 }
 
 /* ---------- dados do mundo ---------- */
-#define NITEMS  10
+#define NITEMS  11
 #define NITEMS_OLD 8
 #define NW      8
 #define NWP     10
@@ -259,7 +259,8 @@ static int audio_thread(SceSize args, void *argp) {
 #define NTREES  220
 #define NZ      40
 #define NZREG   32
-#define NB      13
+#define NB_BASE 13
+#define NB      31
 #define NROADS  8
 #define NCARS   10
 #define DAY_LEN 360.0f
@@ -273,8 +274,8 @@ static int audio_thread(SceSize args, void *argp) {
 #define LAKE_HX 14.0f
 #define LAKE_HZ 10.0f
 
-enum { I_MAD, I_SUC, I_PANO, I_COM, I_AGUA, I_BAND, I_MUN, I_PECA, I_CART, I_RIFLE };
-static const char *itemName[NITEMS] = { "Madeira", "Sucata", "Pano", "Comida", "Agua", "Bandagem", "Municao", "Peca radio", "Cartuchos", "Balas rifle" };
+enum { I_MAD, I_SUC, I_PANO, I_COM, I_AGUA, I_BAND, I_MUN, I_PECA, I_CART, I_RIFLE, I_GAS };
+static const char *itemName[NITEMS] = { "Madeira", "Sucata", "Pano", "Comida", "Agua", "Bandagem", "Municao", "Peca radio", "Cartuchos", "Balas rifle", "Gasolina" };
 static const char *wName[NW] = { "Punhos", "Bastao", "Machado", "Facao", "Pistola", "SMG", "Escopeta", "Rifle" };
 static const float wDmg[NW]   = { 8.0f, 20.0f, 38.0f, 28.0f, 28.0f, 16.0f, 14.0f, 70.0f };
 static const float wRange[NW] = { 2.0f, 2.7f, 2.9f, 2.8f, 26.0f, 24.0f, 12.0f, 40.0f };
@@ -302,6 +303,26 @@ static const Bld BLD[NB] = {
     { -65, -15, 1.6f, 1.6f, 16.0f, 0xff707070, 0xff2020d0, 1 },
     { 62, 50, 4.0f, 3.0f, 4.0f, 0xff506040, 0xff304028, 1 },
     { 74, 56, 3.0f, 3.0f, 4.0f, 0xff506040, 0xff304028, 1 }
+,
+/* cidades distantes (zona sem zumbis) */
+    { 84.0f, -68.0f, 3.5f, 3.0f, 5.0f, 0xff8a9aa8, 0xff303050, 1 },
+    { 95.0f, -68.0f, 3.5f, 3.0f, 4.0f, 0xff7080a0, 0xff303050, 1 },
+    { 106.0f, -68.0f, 3.5f, 3.0f, 5.0f, 0xff909098, 0xff303050, 1 },
+    { 84.0f, -52.0f, 3.5f, 3.0f, 4.0f, 0xff8a9aa8, 0xff303050, -1 },
+    { 95.0f, -52.0f, 3.5f, 3.0f, 5.0f, 0xff7080a0, 0xff303050, -1 },
+    { 106.0f, -52.0f, 3.5f, 3.0f, 4.0f, 0xff909098, 0xff303050, -1 },
+    { -111.0f, 44.0f, 3.5f, 3.0f, 5.0f, 0xff8a9aa8, 0xff303050, 1 },
+    { -100.0f, 44.0f, 3.5f, 3.0f, 4.0f, 0xff7080a0, 0xff303050, 1 },
+    { -89.0f, 44.0f, 3.5f, 3.0f, 5.0f, 0xff909098, 0xff303050, 1 },
+    { -111.0f, 60.0f, 3.5f, 3.0f, 4.0f, 0xff8a9aa8, 0xff303050, -1 },
+    { -100.0f, 60.0f, 3.5f, 3.0f, 5.0f, 0xff7080a0, 0xff303050, -1 },
+    { -89.0f, 60.0f, 3.5f, 3.0f, 4.0f, 0xff909098, 0xff303050, -1 },
+    { -41.0f, -116.0f, 3.5f, 3.0f, 5.0f, 0xff8a9aa8, 0xff303050, 1 },
+    { -30.0f, -116.0f, 3.5f, 3.0f, 4.0f, 0xff7080a0, 0xff303050, 1 },
+    { -19.0f, -116.0f, 3.5f, 3.0f, 5.0f, 0xff909098, 0xff303050, 1 },
+    { -41.0f, -100.0f, 3.5f, 3.0f, 4.0f, 0xff8a9aa8, 0xff303050, -1 },
+    { -30.0f, -100.0f, 3.5f, 3.0f, 5.0f, 0xff7080a0, 0xff303050, -1 },
+    { -19.0f, -100.0f, 3.5f, 3.0f, 4.0f, 0xff909098, 0xff303050, -1 }
 };
 static const float ROADS[NROADS][4] = {
     { 0, 0, 0, -37 }, { 0, -37, 70, -37 }, { 0, 0, 0, 70 }, { -70, 0, 0, 0 },
@@ -341,6 +362,16 @@ static void do_sleep(void);
 static int inCar = -1;
 static float carX[NCARS], carZ[NCARS], carAng[NCARS], carSpd[NCARS];
 static int camMode = 1;
+#define NCITY 3
+#define CITY_R 24.0f
+#define STN_X (-29.0f)
+#define STN_Z (-52.0f)
+static const float CITY[NCITY][2] = { { 95.0f, -60.0f }, { -100.0f, 52.0f }, { -30.0f, -108.0f } };
+static const char *CITY_NAME[NCITY] = { "Vale Leste", "Morro Oeste", "Forte Sul" };
+static int cityVis[NCITY];
+static float carFuel[NCARS];
+static int stnSel = 0;
+static int near_station(void);
 static float camSpeed = 1.0f;
 static int curW = 0, selUse = 0, kills = 0, parts = 0, rescue = 0, deaths = 0, chasers = 0;
 static int mode = 0, menuSel = 0, showHelp = 1, endingSeen = 0;
@@ -440,6 +471,7 @@ static int blocked(float x, float z, float margin) {
     if (near_road(x, z, margin - 2.0f)) return 1;
     if (dist2d(x, z, BASE_X, BASE_Z) < SAFE_R + 4.0f) return 1;
     if (dist2d(x, z, 68, 53) < 19.0f) return 1;
+    for (int c = 0; c < NCITY; c++) if (dist2d(x, z, CITY[c][0], CITY[c][1]) < CITY_R + margin) return 1;
     return 0;
 }
 
@@ -463,7 +495,8 @@ static void respawn_zombie(Zomb *z) {
 static void init_world(void) {
     nloot = 0;
     init_survivors();
-    for (int c = 0; c < NCARS; c++) { carX[c] = CARS[c][0]; carZ[c] = CARS[c][1]; carAng[c] = CARS[c][2]; carSpd[c] = 0; }
+    for (int c = 0; c < NCARS; c++) { carX[c] = CARS[c][0]; carZ[c] = CARS[c][1]; carAng[c] = CARS[c][2]; carSpd[c] = 0; carFuel[c] = 25.0f + frand() * 45.0f; }
+    for (int c = 0; c < NCITY; c++) cityVis[c] = 0;
     inCar = -1;
     for (int i = 0; i < 8; i++) add_loot(BLD[i].x, BLD[i].z + BLD[i].door * (BLD[i].hd + 1.3f), 0);
     add_loot(-29, -51.2f, 0);                       /* posto */
@@ -481,8 +514,9 @@ static void init_world(void) {
         do { x = (frand() * 2 - 1) * (WORLD - 6); z = (frand() * 2 - 1) * (WORLD - 6); } while (++tries < 30 && (blocked(x, z, 3.0f) || dist2d(x, z, BASE_X, BASE_Z) < 16.0f));
         add_loot(x, z, 4);
     }
-    for (int i = 0; i < NB; i++)   /* saque dentro de cada casa */
+    for (int i = 0; i < NB_BASE; i++)   /* saque dentro de cada casa */
         add_loot(BLD[i].x, BLD[i].z - BLD[i].door * (BLD[i].hd * 0.35f), 5);
+    for (int c = 0; c < NCITY; c++) add_loot(CITY[c][0], CITY[c][1], 2);   /* cache militar em cada cidade */
     for (int i = 0; i < NTREES; i++) {
         float x, z; int tries = 0;
         do { x = (frand() * 2 - 1) * (WORLD - 3); z = (frand() * 2 - 1) * (WORLD - 3); } while (++tries < 40 && blocked(x, z, 4.0f));
@@ -516,6 +550,7 @@ static void init_world(void) {
 
 static void reset_state(void) {
     memset(inv, 0, sizeof(inv));
+    for (int c = 0; c < NCITY; c++) cityVis[c] = 0;
     inv[I_COM] = 2; inv[I_AGUA] = 2; inv[I_BAND] = 1; inv[I_MAD] = 2; inv[I_MUN] = 0;
     for (int i = 0; i < NW; i++) hasW[i] = 0;
     hasW[0] = 1; curW = 0; selUse = 0;
@@ -551,6 +586,9 @@ static SaveExtra4 gExtra4; static int gHasExtra4 = 0;
 #define SAVE_MAGIC5 0x35565347u
 typedef struct { unsigned int magic; int fireLvl, hasLant, lantOn; } SaveExtra5;
 static SaveExtra5 gExtra5; static int gHasExtra5 = 0;
+#define SAVE_MAGIC6 0x36565347u
+typedef struct { unsigned int magic; int gas; int cityVis[NCITY]; float carFuel[NCARS]; unsigned char looted2[16]; float lootT2[16]; } SaveExtra6;
+static SaveExtra6 gExtra6; static int gHasExtra6 = 0;
 static SaveExtra3 gSurv; static int gHasSurv = 0;
 
 static void slot_path(int slot, char *out) { sprintf(out, SAVE_DIR "/save%d.dat", slot + 1); }
@@ -585,12 +623,17 @@ static int save_game(void) {
     sceIoWrite(fd, &f4, sizeof(f4));
     SaveExtra5 f5; memset(&f5, 0, sizeof(f5)); f5.magic = SAVE_MAGIC5; f5.fireLvl = fireLvl; f5.hasLant = hasLant; f5.lantOn = lantOn;
     sceIoWrite(fd, &f5, sizeof(f5));
+    SaveExtra6 f6; memset(&f6, 0, sizeof(f6)); f6.magic = SAVE_MAGIC6; f6.gas = inv[I_GAS];
+    for (int c = 0; c < NCITY; c++) f6.cityVis[c] = cityVis[c];
+    for (int c = 0; c < NCARS; c++) f6.carFuel[c] = carFuel[c];
+    for (int i = SAVE_NLOOT; i < nloot && i < SAVE_NLOOT + 16; i++) { f6.looted2[i - SAVE_NLOOT] = (unsigned char)loot[i].looted; f6.lootT2[i - SAVE_NLOOT] = loot[i].t; }
+    sceIoWrite(fd, &f6, sizeof(f6));
     sceIoClose(fd);
     return w == (int)sizeof(d) && w2 == (int)sizeof(e);
 }
 
 static int read_slot(int slot, SaveData *d, SaveExtra *e, int *hasE) {
-    gHasSurv = 0; gHasExtra4 = 0; gHasExtra5 = 0;
+    gHasSurv = 0; gHasExtra4 = 0; gHasExtra5 = 0; gHasExtra6 = 0;
     char p[96]; slot_path(slot, p);
     int fd = sceIoOpen(p, PSP_O_RDONLY, 0777);
     if (fd < 0) return 0;
@@ -605,6 +648,9 @@ static int read_slot(int slot, SaveData *d, SaveExtra *e, int *hasE) {
     SaveExtra5 f5; int r5 = sceIoRead(fd, &f5, sizeof(f5));
     gHasExtra5 = (r5 == (int)sizeof(f5) && f5.magic == SAVE_MAGIC5);
     if (gHasExtra5) gExtra5 = f5;
+    SaveExtra6 f6; int r6 = sceIoRead(fd, &f6, sizeof(f6));
+    gHasExtra6 = (r6 == (int)sizeof(f6) && f6.magic == SAVE_MAGIC6);
+    if (gHasExtra6) gExtra6 = f6;
     sceIoClose(fd);
     *hasE = (r2 == (int)sizeof(*e) && e->magic == SAVE_MAGIC2);
     return r == (int)sizeof(*d) && d->magic == SAVE_MAGIC && d->version == 1;
@@ -652,6 +698,12 @@ static int load_game(void) {
     fireLvl = gHasExtra5 ? gExtra5.fireLvl : 1; if (fireLvl < 1 || fireLvl > 3) fireLvl = 1;
     hasLant = gHasExtra5 ? (gExtra5.hasLant ? 1 : 0) : 0;
     lantOn = gHasExtra5 ? (gExtra5.lantOn ? 1 : 0) : 0;
+    inv[I_GAS] = gHasExtra6 ? gExtra6.gas : 0;
+    for (int c = 0; c < NCITY; c++) cityVis[c] = gHasExtra6 ? gExtra6.cityVis[c] : 0;
+    if (gHasExtra6) {
+        for (int c = 0; c < NCARS; c++) carFuel[c] = gExtra6.carFuel[c];
+        for (int i = 0; i < 16 && SAVE_NLOOT + i < nloot; i++) { loot[SAVE_NLOOT + i].looted = gExtra6.looted2[i]; loot[SAVE_NLOOT + i].t = gExtra6.lootT2[i]; }
+    }
     if (gHasSurv) {
         int nf = 0;
         for (int i = 0; i < SAVE_NSURV; i++) {
@@ -693,6 +745,7 @@ static void open_loot(int i) {
         got[I_SUC] = 1 + (int)(frand() * 3);
         if (frand() < 0.4f) got[I_MUN] = 2 + (int)(frand() * 3);
         if (frand() < 0.25f) got[I_COM] = 1;
+        if (frand() < 0.5f) got[I_GAS] = 1 + (int)(frand() * 2.0f);
     } else if (L->kind == 5) {
         int rolls = 2 + (frand() < 0.5f ? 1 : 0);
         for (int r = 0; r < rolls; r++) {
@@ -975,6 +1028,7 @@ static void interact(void) {
     if (near_heli()) { play_sfx(12); check_ending(); return; }
     if (near_camp()) { mode = 2; menuSel = 0; menuMsg[0] = 0; play_sfx(5); return; }
     if (dist2d(px, pz, CH_X, CH_Z) < 3.5f) { do_sleep(); return; }
+    if (near_station()) { mode = 8; stnSel = 0; menuMsg[0] = 0; play_sfx(4); return; }
     for (int c = 0; c < NCARS; c++)
         if (dist2d(px, pz, carX[c], carZ[c]) < 3.5f) {
             inCar = c; px = carX[c]; pz = carZ[c]; pang = carAng[c]; carSpd[c] = 0;
@@ -1183,6 +1237,38 @@ static int net_unpack(const NetPacket *pk, NetPlayer *out) {
     return 1;
 }
 
+static int near_station(void) { return dist2d(px, pz, STN_X, STN_Z) < 6.0f; }
+
+static void refuel_nearby(void) {
+    int c = inCar;
+    if (c < 0) {
+        float bd = 8.0f;
+        for (int k = 0; k < NCARS; k++) {
+            float d = dist2d(carX[k], carZ[k], STN_X, STN_Z);
+            if (d < bd) { bd = d; c = k; }
+        }
+    }
+    if (c < 0) { strcpy(menuMsg, "Leve um carro ate o posto."); play_sfx(10); return; }
+    int need = (int)ceilf((100.0f - carFuel[c]) / 25.0f);
+    if (need <= 0) { strcpy(menuMsg, "Tanque cheio."); play_sfx(4); return; }
+    if (inv[I_GAS] < need) { sprintf(menuMsg, "Faltam %d gasolina.", need - inv[I_GAS]); play_sfx(10); return; }
+    inv[I_GAS] -= need; carFuel[c] = 100.0f;
+    strcpy(menuMsg, "Carro abastecido!"); play_sfx(3);
+}
+
+static void station_update(unsigned int pressed) {
+    if (pressed & PSP_CTRL_UP)   { stnSel = (stnSel + 2) % 3; play_sfx(5); }
+    if (pressed & PSP_CTRL_DOWN) { stnSel = (stnSel + 1) % 3; play_sfx(5); }
+    if (pressed & (PSP_CTRL_START | PSP_CTRL_CIRCLE | PSP_CTRL_TRIANGLE)) { mode = 0; return; }
+    if (pressed & PSP_CTRL_CROSS) {
+        if (stnSel == 0) {
+            if (coins >= 6) { coins -= 6; inv[I_GAS] += 3; strcpy(menuMsg, "Comprou 3 gasolina!"); play_sfx(3); }
+            else { strcpy(menuMsg, "Moedas insuficientes (6)."); play_sfx(10); }
+        } else if (stnSel == 1) refuel_nearby();
+        else mode = 0;
+    }
+}
+
 static void leave_car(void) {
     int c = inCar;
     if (c < 0) return;
@@ -1206,6 +1292,7 @@ static void car_update(float dt, const SceCtrlData *pad, unsigned int pressed) {
     float steer = (pad->Lx - 128) / 128.0f, thr = (128 - pad->Ly) / 128.0f;
     if (fabsf(steer) < 0.12f) steer = 0;
     if (fabsf(thr) < 0.12f) thr = 0;
+    if (carFuel[c] <= 0.0f) thr = 0.0f;
     carSpd[c] += thr * 14.0f * dt;
     if (thr == 0) carSpd[c] *= (1.0f - 0.8f * dt);
     if (carSpd[c] > 22.0f) carSpd[c] = 22.0f;
@@ -1220,6 +1307,7 @@ static void car_update(float dt, const SceCtrlData *pad, unsigned int pressed) {
     float ox = carX[c], oz = carZ[c];
     collide(&carX[c], &carZ[c], 1.6f);
     if (dist2d(ox, oz, carX[c], carZ[c]) > 0.01f) carSpd[c] *= 0.3f;   /* bateu: perde velocidade */
+    carFuel[c] -= fabsf(carSpd[c]) * dt * 0.05f; if (carFuel[c] < 0.0f) carFuel[c] = 0.0f;
     px = carX[c]; pz = carZ[c]; pang = carAng[c];
     /* atropela zumbis em alta velocidade */
     if (fabsf(carSpd[c]) > 6.0f)
@@ -1232,7 +1320,18 @@ static void car_update(float dt, const SceCtrlData *pad, unsigned int pressed) {
     update_survivors(dt);
     if (pressed & PSP_CTRL_CROSS) { leave_car(); return; }
     if ((pressed & PSP_CTRL_SQUARE) || ((pad->Buttons & PSP_CTRL_SQUARE) && wAuto[curW])) player_attack();
+    if ((pressed & PSP_CTRL_TRIANGLE) && dist2d(px, pz, STN_X, STN_Z) < 9.0f) { mode = 8; stnSel = 0; menuMsg[0] = 0; play_sfx(4); }
     if (pressed & PSP_CTRL_START) { mode = 1; menuSel = 0; menuMsg[0] = 0; }
+}
+
+static void city_check(void) {
+    for (int c = 0; c < NCITY; c++) {
+        if (cityVis[c] || dist2d(px, pz, CITY[c][0], CITY[c][1]) > 9.0f) continue;
+        cityVis[c] = 1;
+        int n = cityVis[0] + cityVis[1] + cityVis[2];
+        char m[64]; sprintf(m, "Chegou em %s! (%d/3)", CITY_NAME[c], n); say(m); play_sfx(9);
+        if (n == NCITY && !endingSeen) { say("Todas as cidades visitadas! Voce zerou!"); check_ending(); }
+    }
 }
 
 static void update(float dt, const SceCtrlData *pad, unsigned int pressed) {
@@ -1591,6 +1690,12 @@ static void draw_building(const Bld *b) {
 }
 
 static void draw_world_pois(void) {
+    if (NEAR(STN_X, STN_Z, 70)) {
+        box(STN_X - 2.0f, 0, STN_Z, 0.6f, 1.6f, 0.6f, 0, 0xff303040);
+        box(STN_X + 2.0f, 0, STN_Z, 0.6f, 1.6f, 0.6f, 0, 0xff303040);
+        box(STN_X, 3.6f, STN_Z, 6.0f, 0.4f, 4.0f, 0, 0xff2040c0);
+        box(STN_X, 0, STN_Z - 3.0f, 5.0f, 2.2f, 3.0f, 0, 0xff8090a0);
+    }
     /* roads */
     for (int i = 0; i < NROADS; i++) {
         float x1 = ROADS[i][0], z1 = ROADS[i][1], x2 = ROADS[i][2], z2 = ROADS[i][3];
@@ -1896,6 +2001,8 @@ static void draw_minimap(void) {
     for (int i = 0; i < nloot; i++) if (loot[i].kind == 3 && !loot[i].looted) minimap_dot(loot[i].x, loot[i].z, 3, 0xff30e0ff, 1);
     for (int i = 0; i < NWP; i++) if (!wpick[i].taken) minimap_dot(wpick[i].x, wpick[i].z, 3, 0xffe040e0, 0);
     for (int i = 0; i < NSURV; i++) if (surv[i].state != 2) minimap_dot(surv[i].x, surv[i].z, 3, surv[i].state == 1 ? 0xff40ff40 : 0xff40e0ff, 1);
+    for (int c = 0; c < NCITY; c++) minimap_dot(CITY[c][0], CITY[c][1], 4, cityVis[c] ? 0xff40ff40 : 0xffff8040, 1);
+    minimap_dot(STN_X, STN_Z, 3, 0xff40c0ff, 1);
     for (int i = 0; i < NZ; i++) if (zomb[i].active && zomb[i].state != 2) minimap_dot(zomb[i].x, zomb[i].z, 2, zomb[i].state == 1 ? 0xff2020ff : 0xff3030a0, 0);
     rect2d(440, 36, 445, 41, 0xffffffff);
 }
@@ -1919,12 +2026,17 @@ static void draw_ui(void) {
     else if (rescue == 1) strcpy(buf, "Obj: sobreviva ate o resgate!");
     else strcpy(buf, "Obj: embarque no helicoptero!");
     ui_text(4, 66, 1, 0xff40e0ff, buf);
-    sprintf(buf, "Grupo: %d/%d  (X: recrutar)", surv_followers(), MAXFOL);
+    sprintf(buf, "Grupo: %d/%d  Cidades: %d/3", surv_followers(), MAXFOL, cityVis[0] + cityVis[1] + cityVis[2]);
     ui_text(4, 78, 1, 0xffffffff, buf);
     draw_minimap();
     rect2d(330, 76, 476, 100, 0x90000000);
     if (wAmmo[curW] >= 0) sprintf(buf, "%s  %s:%d", wName[curW], itemName[wAmmo[curW]], inv[wAmmo[curW]]); else strcpy(buf, wName[curW]);
     ui_text(334, 80, 1, 0xffffffff, buf);
+    if (inCar >= 0) {
+        sprintf(buf, "Gasolina: %d%%", (int)carFuel[inCar]);
+        rect2d(330, 102, 420, 116, 0x90000000);
+        ui_text(334, 104, 1, carFuel[inCar] < 20.0f ? 0xff4040ff : 0xff40e0ff, buf);
+    }
     { static const int ci[3] = { I_COM, I_AGUA, I_BAND };
       sprintf(buf, "< %s x%d >  Cima: usar", itemName[ci[selUse]], inv[ci[selUse]]);
       ui_text(334, 90, 1, 0xffc0c0c0, buf); }
@@ -1963,6 +2075,7 @@ static void draw_ui(void) {
         if (inCar >= 0) pr = "No carro: analogico dirige, X sai";
         else if (near_heli()) pr = "X: embarcar no helicoptero!";
         else if (dist2d(px, pz, CH_X, CH_Z) < 3.5f) pr = "CASA  X: dormir";
+        else if (near_station()) pr = "POSTO  X: abrir";
         else if (near_car_idx() >= 0) pr = "X: entrar no carro";
         else if (near_camp()) pr = "ACAMPAMENTO  X: abrir";
         else if (nearest_wild_surv(4.5f) >= 0) {
@@ -2029,6 +2142,20 @@ static void draw_ui(void) {
         ui_text(46, 214, 1, 0xffc0ffc0, buf);
         ui_text(46, 224, 1, 0xffc0c0c0, "Cima/Baixo + X escolhe   START/O sai");
         if (menuMsg[0]) ui_text(46, 235, 2, 0xff60ff60, menuMsg);
+    } else if (mode == 8) {
+        static const char *sopt[3] = { "Comprar 3 gasolina (6 moedas)", "Abastecer carro no posto", "Sair" };
+        rect2d(0, 0, 480, 272, 0x80000000);
+        window(60, 50, 420, 232);
+        ui_text(150, 58, 2, 0xff40e0ff, "== POSTO ==");
+        sprintf(buf, "Moedas: %d   Gasolina: %d", coins, inv[I_GAS]);
+        ui_text(76, 82, 2, 0xfff0e040, buf);
+        for (int i = 0; i < 3; i++) {
+            int y = 110 + i * 24;
+            if (i == stnSel) rect2d(76, y - 3, 404, y + 17, 0xc0a06020);
+            ui_text(86, y, 2, 0xffffffff, sopt[i]);
+        }
+        if (menuMsg[0]) ui_text(76, 186, 2, 0xff60ff60, menuMsg);
+        ui_text(76, 216, 1, 0xffc0c0c0, "Cima/Baixo + X     START/O sai");
     } else if (mode == 7) {
         rect2d(0, 0, 480, 272, 0x80000000);
         window(36, 24, 444, 254);
@@ -2321,10 +2448,12 @@ int main(void) {
         else if (mode == 1) pause_update(pressed);
         else if (mode == 2) camp_update(pressed);
         else if (mode == 7) coin_shop_update(pressed);
+        else if (mode == 8) station_update(pressed);
         else if (mode == 3) death_update(dt, pressed);
         else if (inCar >= 0) car_update(dt, &pad, pressed);
         else update(dt, &pad, pressed);
 
+        if (appState == APP_PLAY && mode != 3) city_check();
         songId = (appState == APP_PLAY) ? ((chasers > 0) ? 3 : (nightness() > 0.5f ? 2 : 1))
                                         : ((appState == APP_CREDITS || appState == APP_POST) ? 4 : 0);
 
