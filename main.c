@@ -255,7 +255,7 @@ static int audio_thread(SceSize args, void *argp) {
 #define NITEMS_OLD 8
 #define NW      8
 #define NWP     10
-#define NLOOT   64
+#define NLOOT   80
 #define NTREES  220
 #define NZ      40
 #define NZREG   32
@@ -344,6 +344,10 @@ static float hurtT = 0, shotT = 0, shotX1 = 0, shotZ1 = 0, shotX2 = 0, shotZ2 = 
 static float msgTimer = 0, deathT = 0;
 static int facingRight = 1, moving = 0;
 static int firstPerson = 0, coins = 0, shopSel = 0;
+#define FIRE_X 0.0f
+#define FIRE_Z 3.2f
+static int fireLvl = 1, hasLant = 0, lantOn = 0;
+static float fire_radius(void) { return fireLvl == 1 ? 8.0f : (fireLvl == 2 ? 13.0f : 20.0f); }
 static char shopMsg[48] = "";
 static float walkPhase = 0;
 static char msg[64] = "", menuMsg[48] = "";
@@ -399,7 +403,10 @@ static void push_out_rect(float *x, float *z, float r, float cx, float cz, float
     }
 }
 static void collide(float *x, float *z, float r) {
-    for (int i = 0; i < NB; i++) push_out_rect(x, z, r, BLD[i].x, BLD[i].z, BLD[i].hw, BLD[i].hd);
+    for (int i = 0; i < NB; i++) {
+        if (fabsf(*x - BLD[i].x) < 0.9f) continue;   /* vao da porta: da para entrar na casa */
+        push_out_rect(x, z, r, BLD[i].x, BLD[i].z, BLD[i].hw, BLD[i].hd);
+    }
     push_out_rect(x, z, r, LAKE_X, LAKE_Z, LAKE_HX, LAKE_HZ);
 }
 static void collide_trees(float *x, float *z) {
@@ -462,6 +469,8 @@ static void init_world(void) {
         do { x = (frand() * 2 - 1) * (WORLD - 6); z = (frand() * 2 - 1) * (WORLD - 6); } while (++tries < 30 && (blocked(x, z, 3.0f) || dist2d(x, z, BASE_X, BASE_Z) < 16.0f));
         add_loot(x, z, 4);
     }
+    for (int i = 0; i < NB; i++)   /* saque dentro de cada casa */
+        add_loot(BLD[i].x, BLD[i].z - BLD[i].door * (BLD[i].hd * 0.35f), 5);
     for (int i = 0; i < NTREES; i++) {
         float x, z; int tries = 0;
         do { x = (frand() * 2 - 1) * (WORLD - 3); z = (frand() * 2 - 1) * (WORLD - 3); } while (++tries < 40 && blocked(x, z, 4.0f));
@@ -505,6 +514,7 @@ static void reset_state(void) {
     moanCD = 0; drinkCD = 0; msgTimer = 0; deathT = 0; msg[0] = 0; menuMsg[0] = 0;
     facingRight = 1; moving = 0; walkPhase = 0;
     coins = 0; firstPerson = 0;
+    fireLvl = 1; hasLant = 0; lantOn = 0;
 }
 
 /* ---------- salvar / carregar (3 slots) ---------- */
@@ -524,6 +534,9 @@ typedef struct { unsigned int magic; unsigned char state[NSURV]; float hp[NSURV]
 #define SAVE_MAGIC4 0x34565347u
 typedef struct { unsigned int magic; int coins, firstPerson; } SaveExtra4;
 static SaveExtra4 gExtra4; static int gHasExtra4 = 0;
+#define SAVE_MAGIC5 0x35565347u
+typedef struct { unsigned int magic; int fireLvl, hasLant, lantOn; } SaveExtra5;
+static SaveExtra5 gExtra5; static int gHasExtra5 = 0;
 static SaveExtra3 gSurv; static int gHasSurv = 0;
 
 static void slot_path(int slot, char *out) { sprintf(out, SAVE_DIR "/save%d.dat", slot + 1); }
@@ -556,12 +569,14 @@ static int save_game(void) {
     sceIoWrite(fd, &f3, sizeof(f3));
     SaveExtra4 f4; memset(&f4, 0, sizeof(f4)); f4.magic = SAVE_MAGIC4; f4.coins = coins; f4.firstPerson = firstPerson;
     sceIoWrite(fd, &f4, sizeof(f4));
+    SaveExtra5 f5; memset(&f5, 0, sizeof(f5)); f5.magic = SAVE_MAGIC5; f5.fireLvl = fireLvl; f5.hasLant = hasLant; f5.lantOn = lantOn;
+    sceIoWrite(fd, &f5, sizeof(f5));
     sceIoClose(fd);
     return w == (int)sizeof(d) && w2 == (int)sizeof(e);
 }
 
 static int read_slot(int slot, SaveData *d, SaveExtra *e, int *hasE) {
-    gHasSurv = 0; gHasExtra4 = 0;
+    gHasSurv = 0; gHasExtra4 = 0; gHasExtra5 = 0;
     char p[96]; slot_path(slot, p);
     int fd = sceIoOpen(p, PSP_O_RDONLY, 0777);
     if (fd < 0) return 0;
@@ -573,6 +588,9 @@ static int read_slot(int slot, SaveData *d, SaveExtra *e, int *hasE) {
     SaveExtra4 f4; int r4b = sceIoRead(fd, &f4, sizeof(f4));
     gHasExtra4 = (r4b == (int)sizeof(f4) && f4.magic == SAVE_MAGIC4);
     if (gHasExtra4) gExtra4 = f4;
+    SaveExtra5 f5; int r5 = sceIoRead(fd, &f5, sizeof(f5));
+    gHasExtra5 = (r5 == (int)sizeof(f5) && f5.magic == SAVE_MAGIC5);
+    if (gHasExtra5) gExtra5 = f5;
     sceIoClose(fd);
     *hasE = (r2 == (int)sizeof(*e) && e->magic == SAVE_MAGIC2);
     return r == (int)sizeof(*d) && d->magic == SAVE_MAGIC && d->version == 1;
@@ -617,6 +635,9 @@ static int load_game(void) {
     for (int i = 0; i < nloot && i < NLOOT; i++) { loot[i].looted = d.looted[i] ? 1 : 0; loot[i].t = d.lootT[i]; }
     coins = gHasExtra4 ? gExtra4.coins : 0;
     firstPerson = gHasExtra4 ? (gExtra4.firstPerson ? 1 : 0) : 0;
+    fireLvl = gHasExtra5 ? gExtra5.fireLvl : 1; if (fireLvl < 1 || fireLvl > 3) fireLvl = 1;
+    hasLant = gHasExtra5 ? (gExtra5.hasLant ? 1 : 0) : 0;
+    lantOn = gHasExtra5 ? (gExtra5.lantOn ? 1 : 0) : 0;
     if (gHasSurv) {
         int nf = 0;
         for (int i = 0; i < NSURV; i++) {
@@ -646,7 +667,7 @@ static void check_ending(void) {
 /* ---------- jogador ---------- */
 static void open_loot(int i) {
     static const int wt[7] = { 3, 3, 3, 2, 2, 1, 2 };   /* madeira sucata pano comida agua bandagem municao */
-    Loot *L = &loot[i]; int got[NITEMS]; memset(got, 0, sizeof(got)); int wdrop = -1;
+    Loot *L = &loot[i]; int got[NITEMS]; memset(got, 0, sizeof(got)); int wdrop = -1, gotLant = 0;
     if (L->kind == 0) {
         int rolls = 2 + (frand() < 0.5f ? 1 : 0) + (dist2d(L->x, L->z, BASE_X, BASE_Z) > 45.0f ? 1 : 0);
         for (int r = 0; r < rolls; r++) {
@@ -658,6 +679,18 @@ static void open_loot(int i) {
         got[I_SUC] = 1 + (int)(frand() * 3);
         if (frand() < 0.4f) got[I_MUN] = 2 + (int)(frand() * 3);
         if (frand() < 0.25f) got[I_COM] = 1;
+    } else if (L->kind == 5) {
+        int rolls = 2 + (frand() < 0.5f ? 1 : 0);
+        for (int r = 0; r < rolls; r++) {
+            float v = frand();
+            if (v < 0.25f) got[I_COM] += 1;
+            else if (v < 0.45f) got[I_AGUA] += 1;
+            else if (v < 0.6f) got[I_BAND] += 1;
+            else if (v < 0.8f) got[I_MUN] += 2 + (int)(frand() * 3.0f);
+            else if (v < 0.9f) got[I_PANO] += 1 + (int)(frand() * 2.0f);
+            else got[I_SUC] += 1 + (int)(frand() * 2.0f);
+        }
+        if (!hasLant && frand() < 0.12f) { hasLant = 1; gotLant = 1; }
     } else if (L->kind == 4) {
         int rolls = 1 + (frand() < 0.5f ? 1 : 0);
         for (int r = 0; r < rolls; r++) {
@@ -688,7 +721,7 @@ static void open_loot(int i) {
         char t[24]; sprintf(t, "%s%s", n ? ", " : "", wName[wdrop]); if (strlen(b) + strlen(t) < 40) strcat(b, t);
     }
     char m[64]; sprintf(m, "Achou: %s", b[0] ? b : "nada");
-    say(m); L->looted = 1; L->t = (L->kind == 3) ? 1e9f : 600.0f; play_sfx(L->kind == 3 ? 11 : 9);
+    say(m); if (gotLant) say("Achou uma Lanterna! SELECT liga e desliga."); L->looted = 1; L->t = (L->kind == 3) ? 1e9f : 600.0f; play_sfx(L->kind == 3 ? 11 : 9);
 }
 
 static void player_die(void) {
@@ -1016,8 +1049,8 @@ static void do_sleep(void) {
 
 
 static void camp_update(unsigned int pressed) {
-    if (pressed & PSP_CTRL_UP)   { menuSel = (menuSel + 6) % 7; play_sfx(5); }
-    if (pressed & PSP_CTRL_DOWN) { menuSel = (menuSel + 1) % 7; play_sfx(5); }
+    if (pressed & PSP_CTRL_UP)   { menuSel = (menuSel + 7) % 8; play_sfx(5); }
+    if (pressed & PSP_CTRL_DOWN) { menuSel = (menuSel + 1) % 8; play_sfx(5); }
     if (pressed & (PSP_CTRL_START | PSP_CTRL_CIRCLE | PSP_CTRL_TRIANGLE)) { mode = 0; return; }
     if (pressed & PSP_CTRL_CROSS) {
         if (menuSel == 0) {
@@ -1038,6 +1071,11 @@ static void camp_update(unsigned int pressed) {
             if (rescue != 0) { strcpy(menuMsg, "O resgate ja foi chamado!"); play_sfx(10); }
             else if (parts < 4) { sprintf(menuMsg, "Faltam %d pecas de radio!", 4 - parts); play_sfx(10); }
             else { rescue = 1; rescueT = 100.0f; hordeT = 3.0f; mode = 0; say("Resgate chamado! Aguente 100 segundos!"); play_sfx(11); }
+        } else if (menuSel == 6) {
+            if (fireLvl >= 3) { strcpy(menuMsg, "Fogueira no nivel maximo!"); play_sfx(10); }
+            else if (fireLvl == 1 && inv[I_MAD] >= 6) { inv[I_MAD] -= 6; fireLvl = 2; strcpy(menuMsg, "Fogueira nivel 2: luz maior!"); play_sfx(4); }
+            else if (fireLvl == 2 && inv[I_MAD] >= 12 && inv[I_SUC] >= 3) { inv[I_MAD] -= 12; inv[I_SUC] -= 3; fireLvl = 3; strcpy(menuMsg, "Fogueira nivel 3: luz maxima!"); play_sfx(4); }
+            else { strcpy(menuMsg, fireLvl == 1 ? "Faltam 6 madeira!" : "Faltam 12 madeira e 3 sucata!"); play_sfx(10); }
         } else mode = 0;
     }
 }
@@ -1067,19 +1105,20 @@ static void coin_shop_update(unsigned int pressed) {
 }
 
 static void pause_update(unsigned int pressed) {
-    if (pressed & PSP_CTRL_UP)   { menuSel = (menuSel + 7) % 8; play_sfx(5); }
-    if (pressed & PSP_CTRL_DOWN) { menuSel = (menuSel + 1) % 8; play_sfx(5); }
+    if (pressed & PSP_CTRL_UP)   { menuSel = (menuSel + 8) % 9; play_sfx(5); }
+    if (pressed & PSP_CTRL_DOWN) { menuSel = (menuSel + 1) % 9; play_sfx(5); }
     if (pressed & (PSP_CTRL_START | PSP_CTRL_CIRCLE)) { mode = 0; return; }
     if (pressed & PSP_CTRL_CROSS) {
         if (menuSel == 0) mode = 0;
         else if (menuSel == 1) { musicOn = !musicOn; play_sfx(5); }
         else if (menuSel == 2) { firstPerson = !firstPerson; play_sfx(5); }
-        else if (menuSel == 3) { mode = 7; shopSel = 0; shopMsg[0] = 0; play_sfx(4); }
-        else if (menuSel == 4) strcpy(menuMsg, save_game() ? "Jogo salvo!" : "Erro ao salvar!");
-        else if (menuSel == 5) {
+        else if (menuSel == 3) { showHelp = !showHelp; play_sfx(5); }
+        else if (menuSel == 4) { mode = 7; shopSel = 0; shopMsg[0] = 0; play_sfx(4); }
+        else if (menuSel == 5) strcpy(menuMsg, save_game() ? "Jogo salvo!" : "Erro ao salvar!");
+        else if (menuSel == 6) {
             if (save_game()) { mode = 0; appState = APP_TITLE; titleSel = 0; }
             else strcpy(menuMsg, "Erro ao salvar!");
-        } else if (menuSel == 6) { mode = 0; appState = APP_TITLE; titleSel = 0; }
+        } else if (menuSel == 7) { mode = 0; appState = APP_TITLE; titleSel = 0; }
         else running = 0;
     }
 }
@@ -1181,7 +1220,10 @@ static void update(float dt, const SceCtrlData *pad, unsigned int pressed) {
     if (pressed & PSP_CTRL_LEFT)  { selUse = (selUse + 2) % 3; play_sfx(5); }
     if (pressed & PSP_CTRL_RIGHT) { selUse = (selUse + 1) % 3; play_sfx(5); }
     if (pressed & PSP_CTRL_UP) use_item();
-    if (pressed & PSP_CTRL_SELECT) showHelp = !showHelp;
+    if (pressed & PSP_CTRL_SELECT) {
+        if (hasLant) { lantOn = !lantOn; say(lantOn ? "Lanterna ligada." : "Lanterna desligada."); play_sfx(5); }
+        else say("Voce ainda nao tem lanterna.");
+    }
     if (pressed & PSP_CTRL_TRIANGLE) {
         for (int k = 1; k <= NW; k++) { int w = (curW + k) % NW; if (hasW[w]) { curW = w; break; } }
         char m[40]; sprintf(m, "Arma: %s", wName[curW]); say(m); play_sfx(5);
@@ -1386,7 +1428,7 @@ static void body_part(float x, float z, float yaw, float ox, float oy, float oz,
 }
 
 typedef struct { unsigned int skin, shirt, pants, hair, eye; } HPal;
-static const HPal HPAL_PLAYER = { 0xff90b8f0, 0xff405830, 0xff604838, 0xff2040a0, 0xff202020 };
+static const HPal HPAL_PLAYER = { 0xff90b8f0, 0xffb06020, 0xff604838, 0xff2040a0, 0xff202020 };
 static const HPal HPAL_Z[3] = {
     { 0xff60b080, 0xff506890, 0xff404858, 0xff203030, 0xff2020e0 },
     { 0xff70c090, 0xff3030a0, 0xff303038, 0xff202040, 0xff30d0ff },
@@ -1556,9 +1598,32 @@ static int aim_screen(float *sx, float *sy) {
     return *sx >= 0.0f && *sx < 480.0f && *sy >= 0.0f && *sy < 272.0f;
 }
 
+static void draw_fire(void) {
+    for (int i = 0; i < 8; i++) {
+        float a = i * 0.7854f;
+        box(FIRE_X + cosf(a) * 1.1f, 0, FIRE_Z + sinf(a) * 1.1f, 0.4f, 0.3f, 0.4f, 0, 0xff505860);
+    }
+    box(FIRE_X, 0.2f, FIRE_Z, 1.6f, 0.2f, 0.25f, 0.5f, 0xff203050);
+    box(FIRE_X, 0.2f, FIRE_Z, 1.6f, 0.2f, 0.25f, -0.5f, 0xff203050);
+    float h = 0.6f + 0.3f * fireLvl;
+    for (int i = 0; i < 3; i++) {
+        float fl = 0.8f + 0.2f * sinf(gameTime * 9.0f + i * 2.1f);
+        box(FIRE_X + (i - 1) * 0.25f, 0.4f, FIRE_Z, 0.35f, h * fl, 0.35f, 0, (i == 1) ? 0xff30e0ff : 0xff2080ff);
+    }
+}
+
+/* luz: 0..1 perto da fogueira (pelo alcance do nivel) ou com a lanterna ligada */
+static float light_boost(void) {
+    float bst = 0.0f, df = dist2d(px, pz, FIRE_X, FIRE_Z), fr = fire_radius();
+    if (df < fr) bst = 1.0f - df / fr;
+    if (lantOn && hasLant && bst < 0.8f) bst = 0.8f;
+    return bst;
+}
+
 static void draw_scene(void) {
     float dl = daylight(), nt = nightness();
     float b = 0.2f + 0.8f * dl;
+    b += light_boost() * 0.5f * nt; if (b > 1.1f) b = 1.1f;
     float skyR = 110.0f * (1 - nt) + 12.0f * nt, skyG = 190.0f * (1 - nt) + 18.0f * nt, skyB = 235.0f * (1 - nt) + 40.0f * nt;
     unsigned int sky = 0xff000000 | ((unsigned int)skyB << 16) | ((unsigned int)skyG << 8) | (unsigned int)skyR;
     sceGuClearColor(sky);
@@ -1590,6 +1655,7 @@ static void draw_scene(void) {
     draw_ground();
     draw_world_pois();
     draw_base();
+    if (NEAR(FIRE_X, FIRE_Z, 70)) draw_fire();
 
     /* caixas de saque */
     for (int i = 0; i < nloot; i++) {
@@ -1678,7 +1744,7 @@ static void draw_scene(void) {
 
     /* jogador em 3D */
     {
-        float sw = moving ? sinf(walkPhase) * 0.8f : 0.0f, aR, aL;
+        float sw = moving ? sinf(walkPhase) * 1.0f : 0.0f, aR, aL;
         if (curW >= 4) { aR = -1.45f + (shotT > 0 ? 0.18f : 0.0f); aL = -1.25f; }
         else {
             aR = -0.7f - sw * 0.4f; aL = sw * 0.6f;
@@ -1782,13 +1848,12 @@ static void draw_ui(void) {
     }
 
     if (mode == 0) {
-        }
         if (showHelp) {
             rect2d(0, 86, 250, 126, 0x90000000);
             ui_text(4, 90, 1, 0xffffffff, "Analog:andar  L/R:camera  X:interagir");
             ui_text(4, 100, 1, 0xffffffff, "Quad:atacar  Circ:rolar  Tri:trocar arma");
             ui_text(4, 110, 1, 0xffffffff, "Esq/Dir:item  Cima:usar  START:menu");
-            ui_text(4, 118, 1, 0xff909090, "SELECT: esconder ajuda");
+            ui_text(4, 118, 1, 0xff909090, "SELECT: lanterna   START: menu");
         }
         if (curW != 0) {   /* mira: so com arma na mao, no ponto para onde a arma aponta */
             float rsx, rsy;
@@ -1799,6 +1864,7 @@ static void draw_ui(void) {
                 rect2d(X - 8, Y, X + 8, Y + 2, cc);
                 rect2d(X - 1, Y - 8, X + 1, Y + 8, cc);
             }
+        }
         if (msgTimer > 0) {
             int w = (int)strlen(msg) * 12; if (w > 470) w = 470;
             int x = (480 - w) / 2;
@@ -1830,36 +1896,38 @@ static void draw_ui(void) {
         if (hurtT > 0) rect2d(0, 0, 480, 272, ((unsigned int)(hurtT / 0.4f * 110.0f) << 24) | 0x000000ff);
         if (hp < 25 && ((int)(gameTime * 3.0f) & 1)) rect2d(0, 0, 480, 272, 0x300000ff);
     } else if (mode == 1) {
-        static const char *opt[8] = { "Continuar", "", "", "Loja", "", "Salvar e ir ao menu", "Menu sem salvar", "Sair do jogo" };
+        static const char *opt[9] = { "Continuar", "", "", "", "Loja", "", "Salvar e ir ao menu", "Menu sem salvar", "Sair do jogo" };
         rect2d(0, 0, 480, 272, 0x80000000);
-        window(96, 22, 384, 250);
-        ui_text(180, 30, 2, 0xff40e0ff, "== MENU ==");
+        window(96, 20, 384, 252);
+        ui_text(180, 28, 2, 0xff40e0ff, "== MENU ==");
         sprintf(buf, "%s - slot %d - %s", survNames[nameIdx], curSlot + 1, diffNames[difficulty]);
-        ui_text(108, 48, 1, 0xffc0c0c0, buf);
-        for (int i = 0; i < 8; i++) {
-            int y = 62 + i * 17;
+        ui_text(108, 46, 1, 0xffc0c0c0, buf);
+        for (int i = 0; i < 9; i++) {
+            int y = 60 + i * 16;
             if (i == menuSel) rect2d(106, y - 2, 374, y + 14, 0xc0a06020);
             if (i == 1) sprintf(buf, "%s Musica: %s", i == menuSel ? ">" : " ", musicOn ? "ligada" : "desligada");
             else if (i == 2) sprintf(buf, "%s Visao: %s", i == menuSel ? ">" : " ", firstPerson ? "1a pessoa" : "3a pessoa");
-            else if (i == 4) sprintf(buf, "%s Salvar (slot %d)", i == menuSel ? ">" : " ", curSlot + 1);
+            else if (i == 3) sprintf(buf, "%s Ajuda: %s", i == menuSel ? ">" : " ", showHelp ? "ligada" : "desligada");
+            else if (i == 5) sprintf(buf, "%s Salvar (slot %d)", i == menuSel ? ">" : " ", curSlot + 1);
             else sprintf(buf, "%s %s", i == menuSel ? ">" : " ", opt[i]);
             ui_text(110, y, 2, 0xffffffff, buf);
         }
-        ui_text(108, 210, 1, 0xffc0c0c0, "Cima/Baixo + X     START volta");
-        if (menuMsg[0]) ui_text(110, 224, 2, 0xff60ff60, menuMsg);
+        ui_text(108, 212, 1, 0xffc0c0c0, "Cima/Baixo + X     START volta");
+        if (menuMsg[0]) ui_text(110, 226, 2, 0xff60ff60, menuMsg);
     } else if (mode == 2) {
         rect2d(0, 0, 480, 272, 0x80000000);
         window(36, 24, 444, 254);
         ui_text(150, 30, 2, 0xff40e0ff, "== ACAMPAMENTO ==");
-        for (int i = 0; i < 7; i++) {
-            int y = 54 + i * 21;
-            if (i == menuSel) rect2d(46, y - 3, 434, y + 16, 0xc0a06020);
+        for (int i = 0; i < 8; i++) {
+            int y = 50 + i * 18;
+            if (i == menuSel) rect2d(46, y - 3, 434, y + 15, 0xc0a06020);
             if (i == 0) strcpy(buf, "Bandagem (2 Pano)");
             else if (i == 1) strcpy(buf, "Municao x6 (2 Sucata)");
             else if (i == 2) strcpy(buf, "Cartuchos x4 (3 Sucata)");
             else if (i == 3) strcpy(buf, "Balas de rifle x3 (4 Sucata)");
             else if (i == 4) strcpy(buf, "Dormir ate amanhecer");
             else if (i == 5) sprintf(buf, "Radio: chamar resgate (%d/4)", parts);
+            else if (i == 6) sprintf(buf, "Melhorar fogueira (nv %d)", fireLvl);
             else strcpy(buf, "Sair");
             ui_text(56, y, 2, 0xffffffff, buf);
         }
