@@ -1418,6 +1418,10 @@ static void draw_humanoid(float x, float z, float yaw, float k, const HPal *p, f
     if (player) {
         body_part(x, z, yaw, 0, 1.86f * k, 0.25f * k, 0, 0, 0.32f * k, 0.05f * k, 0.18f * k, p->hair);
         body_part(x, z, yaw, 0, 0.95f * k, -0.26f * k, 0, 0, 0.44f * k, 0.52f * k, 0.2f * k, 0xff304048);
+        body_part(x, z, yaw, 0, 1.98f * k, 0, 0, 0, 0.52f * k, 0.14f * k, 0.52f * k, 0xffc04020);
+        body_part(x, z, yaw, 0, 1.97f * k, 0.32f * k, 0, 0, 0.5f * k, 0.04f * k, 0.22f * k, 0xff202020);
+        body_part(x, z, yaw, 0, 0.8f * k, 0, 0, 0, 0.6f * k, 0.09f * k, 0.34f * k, 0xff203040);
+        body_part(x, z, yaw, 0.3f * k, 0.8f * k, 0.2f * k, 0, 0, 0.12f * k, 0.14f * k, 0.12f * k, 0xff203040);
     }
     body_part(x, z, yaw, -0.40f * k, 1.5f * k, 0, armR, 1, 0.18f * k, 0.7f * k, 0.18f * k, p->shirt);
     body_part(x, z, yaw,  0.40f * k, 1.5f * k, 0, armL, 1, 0.18f * k, 0.7f * k, 0.18f * k, p->shirt);
@@ -1521,6 +1525,37 @@ static void draw_base(void) {
     }
 }
 
+/* posicao da camera: 3a pessoa atras do jogador, ou 1a pessoa na cabeca */
+static void camera_pos(float *ex, float *ey, float *ez, float *cx, float *cy, float *cz) {
+    *ex = px - sinf(cam) * 11.0f; *ey = 7.0f; *ez = pz - cosf(cam) * 11.0f;
+    *cx = px; *cy = 1.5f; *cz = pz;
+    if (firstPerson) {
+        *ex = px; *ey = 1.75f; *ez = pz;
+        *cx = px + sinf(cam) * 10.0f; *cy = 1.75f; *cz = pz + cosf(cam) * 10.0f;
+    }
+}
+
+/* projeta o ponto para onde a arma aponta na tela (mesma camera da cena) */
+static int aim_screen(float *sx, float *sy) {
+    float R = (wAmmo[curW] >= 0) ? 12.0f : 3.0f;
+    float ex, ey, ez, cx, cy, cz;
+    camera_pos(&ex, &ey, &ez, &cx, &cy, &cz);
+    float tx = px + sinf(pang) * R, tz = pz + cosf(pang) * R;
+    float ty = firstPerson ? ey : 1.2f;
+    float fx = cx - ex, fy = cy - ey, fz = cz - ez, fl = sqrtf(fx * fx + fy * fy + fz * fz);
+    fx /= fl; fy /= fl; fz /= fl;
+    float rx = -cosf(cam), ry = 0.0f, rz = sinf(cam);
+    float ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
+    float dx = tx - ex, dy = ty - ey, dz = tz - ez;
+    float zc = dx * fx + dy * fy + dz * fz;
+    if (zc < 0.5f) return 0;
+    float xc = dx * rx + dy * ry + dz * rz, yc = dx * ux + dy * uy + dz * uz;
+    *sx = 240.0f + 189.0f * xc / zc;
+    *sy = 136.0f - 194.2f * yc / zc;
+    (void)uz;
+    return *sx >= 0.0f && *sx < 480.0f && *sy >= 0.0f && *sy < 272.0f;
+}
+
 static void draw_scene(void) {
     float dl = daylight(), nt = nightness();
     float b = 0.2f + 0.8f * dl;
@@ -1535,8 +1570,8 @@ static void draw_scene(void) {
     sceGumPerspective(70.0f, 16.0f / 9.0f, 1.0f, 200.0f);
     sceGumMatrixMode(GU_VIEW);
     sceGumLoadIdentity();
-    float ex = px - sinf(cam) * 11.0f, ey = 7.0f, ez = pz - cosf(cam) * 11.0f, ccx = px, ccy = 1.5f, ccz = pz;
-    if (firstPerson) { ex = px; ey = 1.75f; ez = pz; ccx = px + sinf(cam) * 10.0f; ccy = 1.6f; ccz = pz + cosf(cam) * 10.0f; }
+    float ex, ey, ez, ccx, ccy, ccz;
+    camera_pos(&ex, &ey, &ez, &ccx, &ccy, &ccz);
     ScePspFVector3 eye = { ex, ey, ez };
     ScePspFVector3 ctr = { ccx, ccy, ccz };
     ScePspFVector3 up  = { 0, 1, 0 };
@@ -1747,11 +1782,6 @@ static void draw_ui(void) {
     }
 
     if (mode == 0) {
-        {   /* mira no centro da tela: vermelha quando ha alvo ao alcance */
-            int tg = aim_target(wAmmo[curW] >= 0 ? wRange[curW] : 3.8f, wAmmo[curW] >= 0 ? 1.1f : 3.2f);
-            unsigned int cc = (tg >= 0) ? 0xff4040ff : 0xffffffff;
-            rect2d(232, 135, 248, 137, cc);
-            rect2d(239, 127, 241, 145, cc);
         }
         if (showHelp) {
             rect2d(0, 86, 250, 126, 0x90000000);
@@ -1760,6 +1790,15 @@ static void draw_ui(void) {
             ui_text(4, 110, 1, 0xffffffff, "Esq/Dir:item  Cima:usar  START:menu");
             ui_text(4, 118, 1, 0xff909090, "SELECT: esconder ajuda");
         }
+        if (curW != 0) {   /* mira: so com arma na mao, no ponto para onde a arma aponta */
+            float rsx, rsy;
+            if (aim_screen(&rsx, &rsy)) {
+                int tg = aim_target(wAmmo[curW] >= 0 ? wRange[curW] : 3.8f, wAmmo[curW] >= 0 ? 1.1f : 3.2f);
+                unsigned int cc = (tg >= 0) ? 0xff4040ff : 0xffffffff;
+                int X = (int)rsx, Y = (int)rsy;
+                rect2d(X - 8, Y, X + 8, Y + 2, cc);
+                rect2d(X - 1, Y - 8, X + 1, Y + 8, cc);
+            }
         if (msgTimer > 0) {
             int w = (int)strlen(msg) * 12; if (w > 470) w = 470;
             int x = (480 - w) / 2;
